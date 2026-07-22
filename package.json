@@ -15,6 +15,9 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
-    "ldapjs": "^3.0.7"
+    "ldapjs": "^3.0.7",
+    "mysql2": "^3.6.0",
+    "nodemailer": "^9.0.3",
+    "web-push": "^3.6.7"
   }
 }

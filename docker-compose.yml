@@ -1,0 +1,47 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file: .env
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: always
+
+  mysql:
+    image: mysql:8
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: Love2eat
+      MYSQL_DATABASE: silverdab_db
+      MYSQL_USER: silverdab
+      MYSQL_PASSWORD: Love2eat
+    ports:
+      - "3307:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    restart: always
+    command:
+      - "http"
+      - "backend:3000"
+      - "--url=https://darkness-hardness-effects.ngrok-free.dev"
+      - "--pooling-enabled"
+    environment:
+      NGROK_AUTHTOKEN: 3GD6SXJnEvdR1w40xSk3lf4VPzV_3g6BS4PzHHV71EnpMFt6Z
+    ports:
+      - "4040:4040"
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
