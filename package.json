@@ -17,6 +17,7 @@
     "jsonwebtoken": "^9.0.3",
     "ldapjs": "^3.0.7",
     "mysql2": "^3.6.0",
+    "node-fetch": "^2.7.0",
     "nodemailer": "^9.0.3",
     "web-push": "^3.6.7"
   }

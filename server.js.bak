@@ -50,22 +50,13 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 // Silently drops any subscription that's gone stale (expired/unsubscribed
 // in the browser) by deleting it from the DB — same "never throw" pattern
 // as the email senders, since a failed push shouldn't break the request flow.
-async function sendWebPushToAdmins({ title, body, url, permissionColumn }) {
+async function sendWebPushToAdmins({ title, body, url }) {
   if (!process.env.VAPID_PUBLIC_KEY) {
     console.warn("🔔 sendWebPushToAdmins: VAPID not configured, skipping");
     return;
   }
   try {
-    let subsQuery = `
-      SELECT ps.* FROM push_subscriptions ps
-      JOIN users u ON u.username = ps.username
-    `;
-    // Superadmins always see everything (same bypass as GET /permissions/me).
-    // Without a permissionColumn, fall back to notifying everyone subscribed.
-    if (permissionColumn) {
-      subsQuery += ` WHERE u.role = 'superadmin' OR u.${permissionColumn} = 1`;
-    }
-    const [subs] = await db.query(subsQuery);
+    const [subs] = await db.query("SELECT * FROM push_subscriptions");
     console.log(`🔔 sendWebPushToAdmins: found ${subs.length} subscription(s)`);
     const payload = JSON.stringify({ title, body, url: url || "/" });
 
@@ -96,44 +87,6 @@ async function sendWebPushToAdmins({ title, body, url, permissionColumn }) {
   }
 }
 
-// Sends a web push to ONE specific user by username — used for driver
-// trip-assignment notifications, where the audience is exactly one person
-// rather than a permission-based group.
-async function sendWebPushToUser(username, { title, body, url }) {
-  if (!process.env.VAPID_PUBLIC_KEY) {
-    console.warn("🔔 sendWebPushToUser: VAPID not configured, skipping");
-    return;
-  }
-  try {
-    const [subs] = await db.query(
-      "SELECT * FROM push_subscriptions WHERE username = ?",
-      [username],
-    );
-    console.log(`🔔 sendWebPushToUser(${username}): found ${subs.length} subscription(s)`);
-    const payload = JSON.stringify({ title, body, url: url || "/" });
-
-    await Promise.all(
-      subs.map(async (sub) => {
-        try {
-          await webpush.sendNotification(
-            { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
-            payload,
-          );
-        } catch (err) {
-          if (err.statusCode === 404 || err.statusCode === 410) {
-            console.warn(`🔔 Subscription ${sub.id} expired/revoked, removing`);
-            await db.query("DELETE FROM push_subscriptions WHERE id = ?", [sub.id]);
-          } else {
-            console.error("🔔 Web push send failed:", err.statusCode, err.message);
-          }
-        }
-      }),
-    );
-  } catch (err) {
-    console.error(`🔔 sendWebPushToUser(${username}) failed:`, err.message);
-  }
-}
-
 console.log("=== Backend Config ===");
 console.log("AD_URL:", AD_URL);
 console.log("AD_BASE_DN:", AD_BASE_DN);
@@ -158,16 +111,6 @@ const db = mysql.createPool({
 db.getConnection()
   .then(() => console.log("✅ MySQL connected!"))
   .catch((err) => console.error("❌ MySQL error:", err.message));
-
-// Returns the current local time as a MySQL DATETIME string
-// ("YYYY-MM-DD HH:MM:SS"), independent of MySQL's own session timezone.
-// Used instead of NOW() in fleet trip inserts to avoid the UTC-vs-local
-// mismatch without touching the global mysql2 pool `timezone` option.
-function nowLocalDatetime() {
-  const d = new Date();
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-}
 
 // ─── Email (SMTP) ──────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -602,487 +545,6 @@ async function sendAdminStatusUpdateNotification({ requestId, statusLabel, extra
     console.log(`📧 Admin status update (${statusLabel}) sent to ${SUPPLY_REQUEST_NOTIFY_EMAIL} for ${request.ticket_number}`);
   } catch (err) {
     console.error("Admin status update email failed:", err.message);
-  }
-}
-
-// Trip requests don't have a single fixed notify address like supply requests
-// do (SUPPLY_REQUEST_NOTIFY_EMAIL) — fleet control access is granted per-user
-// via perm_fleet_control, so look up everyone with that flag (or superadmin)
-// and email them all.
-async function sendFleetTripAdminNotification({
-  requestorName,
-  tripRef,
-  pickupLocationText,
-  dropoffLocationText,
-  tripType,
-  departureDatetime,
-  purpose,
-  passengerCount,
-}) {
-  try {
-    const [rows] = await db.query(
-      `SELECT notification_email, email FROM users
-       WHERE perm_fleet_control = 1`,
-    );
-    const recipients = rows
-      .map((r) => r.notification_email || r.email)
-      .filter(Boolean);
-
-    if (recipients.length === 0) {
-      console.warn("No fleet control recipients found, skipping trip request email.");
-      return;
-    }
-
-    const htmlBody = `
-      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-        <div style="background-color: #b45309; padding: 20px 24px; border-radius: 8px 8px 0 0;">
-          <h2 style="color: #ffffff; margin: 0; font-size: 18px;">New Trip Request — Action Needed</h2>
-        </div>
-        <div style="border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 24px;">
-          <p style="margin: 0 0 12px 0;">Hi,</p>
-          <p style="margin: 0 0 20px 0; line-height: 1.6;">
-            <strong>${requestorName}</strong> has submitted a new trip request that is
-            awaiting dispatch review.
-          </p>
-
-          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Ref</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${tripRef}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Requested By</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${requestorName}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Pick-up</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${pickupLocationText}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Drop-off</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${dropoffLocationText}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Type</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${tripType}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Departure</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${departureDatetime}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Passengers</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${passengerCount ?? 1}</td>
-            </tr>
-          </table>
-
-          ${purpose ? `<p style="margin: 0 0 20px 0; line-height: 1.6; color: #374151;"><strong>Purpose:</strong> ${purpose}</p>` : ""}
-
-          <p style="margin: 0 0 4px 0; line-height: 1.6; font-size: 13px; color: #6b7280;">
-            Please log in to Silverdab UMS to approve or reject this request.
-          </p>
-
-          <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-            <tr>
-              <td style="vertical-align: middle; line-height: 1.6;">
-                Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
-              </td>
-              <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
-              </td>
-            </tr>
-          </table>
-        </div>
-        <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 16px;">
-          This is an automated notification. Please do not reply directly to this email.
-        </p>
-      </div>
-    `;
-
-    await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
-      to: recipients.join(", "),
-      subject: `New Trip Request ${tripRef} — Pending Your Review`,
-      text: `${requestorName} has submitted a new trip request awaiting your approval.\n\nTrip: ${tripRef}\nPick-up: ${pickupLocationText}\nDrop-off: ${dropoffLocationText}\nType: ${tripType}\nDeparture: ${departureDatetime}\n${purpose ? `Purpose: ${purpose}\n` : ""}\nPlease log in to Silverdab UMS to review.`,
-      html: htmlBody,
-      attachments: [
-        {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
-        },
-      ],
-    });
-
-    console.log(`📧 Fleet trip admin notification sent to ${recipients.length} recipient(s) for ${tripRef}`);
-  } catch (err) {
-    console.error("Fleet trip admin email failed:", err.message);
-    // never throw — a failed email should not break the request flow
-  }
-}
-
-const FLEET_TRIP_STATUS_LABELS = {
-  pending: "Pending Review",
-  approved: "Approved",
-  rejected: "Rejected",
-  ongoing: "Ongoing",
-  arrived: "Completed",
-  returning: "Returning",
-  completed: "Completed",
-  cancelled: "Cancelled",
-};
-
-const FLEET_TRIP_STATUS_COLORS = {
-  pending: "#b45309",
-  approved: "#1e3a5f",
-  rejected: "#b91c1c",
-  ongoing: "#1e3a5f",
-  arrived: "#15803d",
-  returning: "#b45309",
-  completed: "#15803d",
-  cancelled: "#475569",
-};
-
-// Notifies the employee who requested the trip whenever its status changes
-// (approved, rejected, ongoing, arrived, returning, completed) — mirrors
-// sendStatusUpdateNotification() for supply requests.
-async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage, updatedByName }) {
-  try {
-    const [tripRows] = await db.query(
-      `SELECT t.trip_ref, t.pickup_location_text, t.dropoff_location_text,
-              t.email_message_id,
-              u.username AS requestor_username, u.display_name AS requestor_name,
-              u.notification_email, u.email
-       FROM fleet_trips t
-       JOIN users u ON u.id = t.requestor_id
-       WHERE t.id = ?`,
-      [tripId],
-    );
-    if (tripRows.length === 0) return;
-    const trip = tripRows[0];
-
-    const toEmail = trip.notification_email || trip.email;
-    if (!toEmail) {
-      console.warn(`No email preference set for ${trip.requestor_username}, skipping trip status update.`);
-      return;
-    }
-
-    const statusLabel = FLEET_TRIP_STATUS_LABELS[statusKey] || statusKey;
-    const statusColor = FLEET_TRIP_STATUS_COLORS[statusKey] || "#1e3a5f";
-
-    const htmlBody = `
-      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-        <div style="background-color: ${statusColor}; padding: 20px 24px; border-radius: 8px 8px 0 0;">
-          <h2 style="color: #ffffff; margin: 0; font-size: 18px;">Trip Request Update</h2>
-        </div>
-        <div style="border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 24px;">
-          <p style="margin: 0 0 12px 0;">Dear ${trip.requestor_name},</p>
-          <p style="margin: 0 0 20px 0; line-height: 1.6;">
-            The status of your trip request has been updated.
-          </p>
-          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Ref</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.trip_ref}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Pick-up</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.pickup_location_text}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Drop-off</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.dropoff_location_text}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Status</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: ${statusColor};">${statusLabel}</td>
-            </tr>
-            ${updatedByName ? `
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Updated By</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${updatedByName}</td>
-            </tr>
-            ` : ""}
-          </table>
-          ${extraMessage ? `<p style="margin: 0 0 20px 0; line-height: 1.6; color: #374151;">${extraMessage}</p>` : ""}
-          <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-            <tr>
-              <td style="vertical-align: middle; line-height: 1.6;">
-                Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
-              </td>
-              <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
-              </td>
-            </tr>
-          </table>
-        </div>
-        <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 16px;">
-          This is an automated notification. Please do not reply directly to this email.
-        </p>
-      </div>
-    `;
-
-    const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
-      to: toEmail,
-      subject: `Re: Trip Request ${trip.trip_ref} Received`,
-      text: `Dear ${trip.requestor_name},\n\nYour trip request ${trip.trip_ref} status has been updated to: ${statusLabel}.${updatedByName ? ` (by ${updatedByName})` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
-      html: htmlBody,
-      attachments: [
-        {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
-        },
-      ],
-    };
-
-    if (trip.email_message_id) {
-      mailOptions.inReplyTo = trip.email_message_id;
-      mailOptions.references = trip.email_message_id;
-    }
-
-    await transporter.sendMail(mailOptions);
-
-    console.log(`📧 Trip status update (${statusLabel}) sent to ${toEmail} for ${trip.trip_ref}`);
-  } catch (err) {
-    console.error("Trip status update email failed:", err.message);
-    // never throw — a failed email should not break the request flow
-  }
-}
-
-// Notifies everyone with fleet control access whenever a trip's status
-// changes — mirrors sendAdminStatusUpdateNotification() for supply requests.
-async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMessage, updatedByName }) {
-  try {
-    const [tripRows] = await db.query(
-      `SELECT t.trip_ref, t.pickup_location_text, t.dropoff_location_text,
-              t.email_message_id,
-              u.display_name AS requestor_name
-       FROM fleet_trips t
-       JOIN users u ON u.id = t.requestor_id
-       WHERE t.id = ?`,
-      [tripId],
-    );
-    if (tripRows.length === 0) return;
-    const trip = tripRows[0];
-
-    const [rows] = await db.query(
-      `SELECT notification_email, email FROM users WHERE perm_fleet_control = 1`,
-    );
-    const recipients = rows
-      .map((r) => r.notification_email || r.email)
-      .filter(Boolean);
-
-    if (recipients.length === 0) {
-      console.warn("No fleet control recipients found, skipping trip admin status email.");
-      return;
-    }
-
-    const statusLabel = FLEET_TRIP_STATUS_LABELS[statusKey] || statusKey;
-    const statusColor = FLEET_TRIP_STATUS_COLORS[statusKey] || "#1e3a5f";
-
-    const htmlBody = `
-      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-        <div style="background-color: ${statusColor}; padding: 20px 24px; border-radius: 8px 8px 0 0;">
-          <h2 style="color: #ffffff; margin: 0; font-size: 18px;">Trip Request Status Changed</h2>
-        </div>
-        <div style="border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 24px;">
-          <p style="margin: 0 0 12px 0;">Hi,</p>
-          <p style="margin: 0 0 20px 0; line-height: 1.6;">
-            This is a record that the status of a trip request was updated.
-          </p>
-
-          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Ref</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.trip_ref}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Requested By</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.requestor_name}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Pick-up</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.pickup_location_text}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Drop-off</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.dropoff_location_text}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">New Status</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: ${statusColor};">${statusLabel}</td>
-            </tr>
-            ${updatedByName ? `
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Updated By</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${updatedByName}</td>
-            </tr>
-            ` : ""}
-          </table>
-
-          ${extraMessage ? `<p style="margin: 0 0 20px 0; line-height: 1.6; color: #374151;">${extraMessage}</p>` : ""}
-
-          <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-            <tr>
-              <td style="vertical-align: middle; line-height: 1.6;">
-                Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
-              </td>
-              <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
-              </td>
-            </tr>
-          </table>
-        </div>
-        <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 16px;">
-          This is an automated notification. Please do not reply directly to this email.
-        </p>
-      </div>
-    `;
-
-    const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
-      to: recipients.join(", "),
-      subject: `Re: Trip Request ${trip.trip_ref} Received`,
-      text: `Trip ${trip.trip_ref} (requested by ${trip.requestor_name}) status changed to: ${statusLabel}.${updatedByName ? ` Updated by ${updatedByName}.` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
-      html: htmlBody,
-      attachments: [
-        {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
-        },
-      ],
-    };
-
-    if (trip.email_message_id) {
-      mailOptions.inReplyTo = trip.email_message_id;
-      mailOptions.references = trip.email_message_id;
-    }
-
-    await transporter.sendMail(mailOptions);
-
-    console.log(`📧 Fleet trip admin status update (${statusLabel}) sent to ${recipients.length} recipient(s) for ${trip.trip_ref}`);
-  } catch (err) {
-    console.error("Fleet trip admin status email failed:", err.message);
-  }
-}
-
-// Sends the initial "Pending Review" confirmation to the employee who booked
-// the trip, and stores the Gmail message id so every later status update can
-// reply into the same thread — mirrors sendRequestNotification() for supply requests.
-async function sendFleetTripRequestNotification({
-  requestorId,
-  requestorName,
-  tripRef,
-  pickupLocationText,
-  dropoffLocationText,
-  tripType,
-  departureDatetime,
-  purpose,
-  passengerCount,
-}) {
-  try {
-    const [rows] = await db.query(
-      "SELECT notification_email, email FROM users WHERE username = ?",
-      [requestorId],
-    );
-    const toEmail = rows[0]?.notification_email || rows[0]?.email;
-    if (!toEmail) {
-      console.warn(`No email preference set for ${requestorId}, skipping trip confirmation.`);
-      return;
-    }
-
-    const htmlBody = `
-      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
-        <div style="background-color: #1e3a5f; padding: 20px 24px; border-radius: 8px 8px 0 0;">
-          <h2 style="color: #ffffff; margin: 0; font-size: 18px;">Silverdab Trip Request</h2>
-        </div>
-        <div style="border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 24px;">
-          <p style="margin: 0 0 12px 0;">Dear ${requestorName},</p>
-          <p style="margin: 0 0 20px 0; line-height: 1.6;">
-            This is to confirm that your trip request has been successfully submitted
-            and is now pending dispatch review.
-          </p>
-
-          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Ref</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${tripRef}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Pick-up</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${pickupLocationText}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Drop-off</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${dropoffLocationText}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Trip Type</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${tripType}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Departure</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${departureDatetime}</td>
-            </tr>
-            <tr>
-              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Status</td>
-              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #b45309;">Pending Review</td>
-            </tr>
-          </table>
-
-          ${purpose ? `<p style="margin: 0 0 20px 0; line-height: 1.6; color: #374151;"><strong>Purpose:</strong> ${purpose}</p>` : ""}
-
-          <p style="margin: 0 0 4px 0; line-height: 1.6; font-size: 13px; color: #6b7280;">
-            You will receive a follow-up notification once your request has been reviewed.
-          </p>
-          <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
-            <tr>
-              <td style="vertical-align: middle; line-height: 1.6;">
-                Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
-              </td>
-              <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
-              </td>
-            </tr>
-          </table>
-        </div>
-        <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 16px;">
-          This is an automated notification. Please do not reply directly to this email.
-        </p>
-      </div>
-    `;
-
-    const info = await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
-      to: toEmail,
-      subject: `Trip Request ${tripRef} Received`,
-      text: `Dear ${requestorName},\n\nYour trip request ${tripRef} has been submitted and is pending review.\n\nPick-up: ${pickupLocationText}\nDrop-off: ${dropoffLocationText}\nType: ${tripType}\nDeparture: ${departureDatetime}`,
-      html: htmlBody,
-      attachments: [
-        {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
-        },
-      ],
-    });
-
-    await db.query(
-      "UPDATE fleet_trips SET email_message_id = ? WHERE trip_ref = ?",
-      [info.messageId, tripRef],
-    );
-
-    console.log(`📧 Trip confirmation sent to ${toEmail} for ${tripRef}`);
-  } catch (err) {
-    console.error("Trip confirmation email failed:", err.message);
-    // never throw — a failed email should not break the request flow
   }
 }
 
@@ -1521,7 +983,7 @@ app.post("/auth/login", async (req, res) => {
     const token = jwt.sign(
       { username: userInfo.sAMAccountName, displayName: userInfo.displayName, email: userInfo.mail, department, title: userInfo.title, phone: userInfo.telephoneNumber, role },
       JWT_SECRET,
-      { expiresIn: "30d" }
+      { expiresIn: "8h" }
     );
 
     //console.log("✅ Login successful:", username);
@@ -2090,7 +1552,7 @@ app.post("/push/subscribe", async (req, res) => {
       `INSERT INTO push_subscriptions (username, endpoint, p256dh, auth)
        VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE username = VALUES(username), p256dh = VALUES(p256dh), auth = VALUES(auth)`,
-      [decoded.username.toLowerCase().trim(), subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth],
+      [decoded.username, subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth],
     );
     return res.json({ success: true });
   } catch (err) {
@@ -2129,7 +1591,7 @@ app.post("/push/subscribe", async (req, res) => {
       `INSERT INTO push_subscriptions (username, endpoint, p256dh, auth)
        VALUES (?, ?, ?, ?)
        ON DUPLICATE KEY UPDATE username = VALUES(username), p256dh = VALUES(p256dh), auth = VALUES(auth)`,
-      [decoded.username.toLowerCase().trim(), subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth],
+      [decoded.username, subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth],
     );
     return res.json({ success: true });
   } catch (err) {
@@ -2274,7 +1736,6 @@ const ticketNumber = `SR-${year}-${nextNum}`;
       title: "New Supply Request",
       body: `${requestedByName} submitted ${ticketNumber} (${items.length} item${items.length !== 1 ? "s" : ""})`,
       url: "/supply-requests",
-      permissionColumn: "perm_office_supplies",
     });
 
     return res.status(201).json({ success: true, ticketNumber });
@@ -2928,9 +2389,7 @@ app.post("/it-inventory", async (req, res) => {
   }
 });
 
-// PATCH /it-inventory/:assetTag — partial update, only sends fields present in body.
-// assetTag (the URL param) is always the ORIGINAL tag used to find the row.
-// If the body includes a new assetTag, this renames the primary key itself.
+// PATCH /it-inventory/:assetTag — partial update, only sends fields present in body
 app.patch("/it-inventory/:assetTag", async (req, res) => {
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith("Bearer "))
@@ -2941,7 +2400,6 @@ app.patch("/it-inventory/:assetTag", async (req, res) => {
   const { assetTag } = req.params;
 
   const FIELD_MAP = {
-    assetTag: "asset_tag",
     company: "company",
     serialNumber: "serial_number",
     model: "model",
@@ -2960,35 +2418,12 @@ app.patch("/it-inventory/:assetTag", async (req, res) => {
     return res.status(400).json({ success: false, message: "No valid fields to update." });
   }
 
-  // Renaming the primary key needs its own validation before the UPDATE.
-  const newAssetTagEntry = entries.find(([key]) => key === "assetTag");
-  const newAssetTag = newAssetTagEntry ? String(newAssetTagEntry[1]).trim() : null;
-
-  if (newAssetTagEntry && !newAssetTag) {
-    return res.status(400).json({ success: false, message: "Asset tag cannot be blank." });
-  }
-
   const setClause = entries.map(([key]) => `${FIELD_MAP[key]} = ?`).join(", ");
   const values = entries.map(([key, value]) =>
-    key === "datePurchased" && value === "" ? null :
-    key === "assetTag" ? newAssetTag :
-    value,
+    key === "datePurchased" && value === "" ? null : value,
   );
 
   try {
-    if (newAssetTag && newAssetTag !== assetTag) {
-      const [dupe] = await db.query(
-        "SELECT asset_tag FROM it_inventory WHERE asset_tag = ?",
-        [newAssetTag],
-      );
-      if (dupe.length > 0) {
-        return res.status(409).json({
-          success: false,
-          message: `Asset tag "${newAssetTag}" already exists.`,
-        });
-      }
-    }
-
     const [result] = await db.query(
       `UPDATE it_inventory SET ${setClause}, updated_at = NOW() WHERE asset_tag = ?`,
       [...values, assetTag],
@@ -3353,7 +2788,7 @@ app.get("/fleet/vehicles", async (req, res) => {
 // POST /fleet/vehicles — body: { plateNumber, type, model, seatingCapacity }
 app.post("/fleet/vehicles", async (req, res) => {
   if (!requireAuth(req, res)) return;
-  const { plateNumber, type, model, seatingCapacity, tramigoDeviceId } = req.body;
+  const { plateNumber, type, model, seatingCapacity } = req.body;
   if (!plateNumber || !type || !model) {
     return res.status(400).json({ success: false, message: "plateNumber, type, and model are required." });
   }
@@ -3363,9 +2798,9 @@ app.post("/fleet/vehicles", async (req, res) => {
       return res.status(409).json({ success: false, message: `Plate number "${plateNumber}" already exists.` });
     }
     await db.query(
-      `INSERT INTO fleet_vehicles (plate_number, type, model, seating_capacity, tramigo_device_id, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, 'idle', NOW(), NOW())`,
-      [plateNumber, type, model, seatingCapacity ?? 4, tramigoDeviceId || null],
+      `INSERT INTO fleet_vehicles (plate_number, type, model, seating_capacity, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'idle', NOW(), NOW())`,
+      [plateNumber, type, model, seatingCapacity ?? 4],
     );
     return res.status(201).json({ success: true });
   } catch (err) {
@@ -3451,8 +2886,7 @@ app.get("/fleet/locations", async (req, res) => {
     const locations = rows.map((r) => ({
       id: String(r.id),
       name: r.name,
-      latitude: r.latitude !== null ? Number(r.latitude) : null,
-      longitude: r.longitude !== null ? Number(r.longitude) : null,
+      shortLabel: r.short_label,
     }));
     return res.json({ success: true, count: locations.length, locations });
   } catch (err) {
@@ -3464,14 +2898,14 @@ app.get("/fleet/locations", async (req, res) => {
 // POST /fleet/locations — body: { name, shortLabel }
 app.post("/fleet/locations", async (req, res) => {
   if (!requireAuth(req, res)) return;
-  const { name, latitude, longitude } = req.body;
-  if (!name) {
-    return res.status(400).json({ success: false, message: "name is required." });
+  const { name, shortLabel } = req.body;
+  if (!name || !shortLabel) {
+    return res.status(400).json({ success: false, message: "name and shortLabel are required." });
   }
   try {
     await db.query(
-      "INSERT INTO fleet_locations (name, latitude, longitude, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW())",
-      [name, latitude ?? null, longitude ?? null],
+      "INSERT INTO fleet_locations (name, short_label, created_at, updated_at) VALUES (?, ?, NOW(), NOW())",
+      [name, shortLabel],
     );
     return res.status(201).json({ success: true });
   } catch (err) {
@@ -3507,7 +2941,6 @@ app.post("/fleet/trips", async (req, res) => {
     returnDatetime,
     purpose,
     passengerCount,
-    passengerNames,
   } = req.body;
 
   if (
@@ -3549,15 +2982,13 @@ app.post("/fleet/trips", async (req, res) => {
     const nextNum = String((maxRows[0].maxNum ?? 0) + 1).padStart(4, "0");
     const tripRef = `TRIP-${year}-${nextNum}`;
 
-    const nowStr = nowLocalDatetime();
-
     const [insertResult] = await conn.query(
       `INSERT INTO fleet_trips
         (trip_ref, requestor_id, pickup_location_id, pickup_location_text,
          dropoff_location_id, dropoff_location_text, trip_type,
          departure_datetime, return_datetime, purpose, passenger_count,
-         passenger_names, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+         status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW(), NOW())`,
       [
         tripRef,
         requestorUserId,
@@ -3570,17 +3001,12 @@ app.post("/fleet/trips", async (req, res) => {
         returnDatetime ?? null,
         purpose ?? "",
         passengerCount ?? 1,
-        Array.isArray(passengerNames) && passengerNames.length > 0
-          ? JSON.stringify(passengerNames)
-          : null,
-        nowStr,
-        nowStr,
       ],
     );
 
     await conn.query(
-      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, created_at) VALUES (?, 'pending', ?, ?)",
-      [insertResult.insertId, requestorUserId, nowStr],
+      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, created_at) VALUES (?, 'pending', ?, NOW())",
+      [insertResult.insertId, requestorUserId],
     );
 
     await conn.commit();
@@ -3591,30 +3017,6 @@ app.post("/fleet/trips", async (req, res) => {
       title: "New Trip Request",
       body: `${requestorName ?? "An employee"} requested ${tripRef} (${pickupLocationText} → ${dropoffLocationText})`,
       url: "/fleet-control-tower",
-      permissionColumn: "perm_fleet_control",
-    });
-
-    sendFleetTripRequestNotification({
-      requestorId,
-      requestorName: requestorName ?? "An employee",
-      tripRef,
-      pickupLocationText: pickupLocationText.trim(),
-      dropoffLocationText: dropoffLocationText.trim(),
-      tripType,
-      departureDatetime,
-      purpose,
-      passengerCount,
-    });
-
-    sendFleetTripAdminNotification({
-      requestorName: requestorName ?? "An employee",
-      tripRef,
-      pickupLocationText: pickupLocationText.trim(),
-      dropoffLocationText: dropoffLocationText.trim(),
-      tripType,
-      departureDatetime,
-      purpose,
-      passengerCount,
     });
 
     return res.status(201).json({ success: true, tripRef });
@@ -3697,13 +3099,6 @@ app.get("/fleet/trips", async (req, res) => {
       returnDatetime: r.return_datetime,
       purpose: r.purpose,
       passengerCount: r.passenger_count,
-      passengerNames: (() => {
-        try {
-          return r.passenger_names ? JSON.parse(r.passenger_names) : [];
-        } catch {
-          return [];
-        }
-      })(),
       vehicleId: r.vehicle_id !== null ? String(r.vehicle_id) : null,
       vehiclePlate: r.vehicle_plate,
       driverId: r.driver_id !== null ? String(r.driver_id) : null,
@@ -3765,11 +3160,10 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
     // logged-in admin's own JWT — so the real approver has to come from the AD
     // username the frontend already sends in the body.
     const [approverRows] = await conn.query(
-      "SELECT id, display_name FROM users WHERE username = ?",
+      "SELECT id FROM users WHERE username = ?",
       [(bodyApprovedByUsername || "").toLowerCase().trim()],
     );
     const approvedById = approverRows[0]?.id ?? null;
-    const approvedByDisplayName = approverRows[0]?.display_name || bodyApprovedByUsername;
     console.log("approve trip:", { bodyApprovedByUsername, approvedById });
 
     // Vehicle/driver get linked here at approval time (not just reserved
@@ -3807,29 +3201,6 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
     }
 
     await conn.commit();
-
-    // Notify the assigned driver they've got a new trip. push_subscriptions
-    // is keyed by username, not users.id, so look that up first.
-    try {
-      const [driverUserRows] = await db.query(
-        "SELECT username FROM users WHERE id = ?",
-        [driverUserId],
-      );
-      const driverUsername = driverUserRows[0]?.username;
-      if (driverUsername) {
-        sendWebPushToUser(driverUsername, {
-          title: "New Trip Assigned",
-          body: `You've been assigned to ${trip.trip_ref} (${trip.pickup_location_text} → ${trip.dropoff_location_text})`,
-          url: "/driver-portal",
-        });
-      }
-    } catch (err) {
-      console.error("Driver trip-assignment push failed:", err.message);
-    }
-
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
-
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -3862,67 +3233,10 @@ app.post("/fleet/trips/:id/reject", async (req, res) => {
       "INSERT INTO fleet_trip_status_log (trip_id, status, note, changed_by, created_at) VALUES (?, 'rejected', ?, ?, NOW())",
       [id, reason ?? "", changedById],
     );
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
     return res.json({ success: true });
   } catch (err) {
     console.error("POST /fleet-trips/:id/reject error:", err);
     return res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// POST /fleet/trips/:id/cancel — employee-initiated, only while the trip
-// hasn't been approved yet. Mirrors POST /supply-requests/:id/cancel.
-app.post("/fleet/trips/:id/cancel", async (req, res) => {
-  const decoded = requireAuth(req, res);
-  if (!decoded) return;
-  const { id } = req.params;
-  const { cancelledByName } = req.body;
-
-  const conn = await db.getConnection();
-  try {
-    await conn.beginTransaction();
-
-    const [rows] = await conn.query(
-      "SELECT status FROM fleet_trips WHERE id = ? FOR UPDATE",
-      [id],
-    );
-    if (rows.length === 0) {
-      await conn.rollback();
-      return res.status(404).json({ success: false, message: "Trip not found" });
-    }
-
-    if (rows[0].status !== "pending") {
-      await conn.rollback();
-      return res.status(409).json({
-        success: false,
-        message: "This trip has already been reviewed and can no longer be cancelled.",
-      });
-    }
-
-    await conn.query(
-      "UPDATE fleet_trips SET status = 'cancelled', updated_at = NOW() WHERE id = ?",
-      [id],
-    );
-
-    const [changerRows] = await conn.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
-    const changedById = changerRows[0]?.id ?? null;
-
-    await conn.query(
-      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, created_at) VALUES (?, 'cancelled', ?, NOW())",
-      [id, changedById],
-    );
-
-    await conn.commit();
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
-    return res.json({ success: true });
-  } catch (err) {
-    await conn.rollback();
-    console.error("POST /fleet-trips/:id/cancel error:", err);
-    return res.status(500).json({ success: false, message: err.message });
-  } finally {
-    conn.release();
   }
 });
 
@@ -3952,8 +3266,6 @@ app.post("/fleet/trips/:id/arrive", async (req, res) => {
       "INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, created_at) VALUES (?, 'arrived', ?, ?, ?, NOW())",
       [id, trip.vehicle_id, trip.driver_id, changedById],
     );
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "arrived" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "arrived" });
     return res.json({ success: true });
   } catch (err) {
     console.error("POST /fleet-trips/:id/arrive error:", err);
@@ -3986,8 +3298,6 @@ app.post("/fleet/trips/:id/start-return", async (req, res) => {
       "INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, created_at) VALUES (?, 'returning', ?, ?, ?, NOW())",
       [id, trip.vehicle_id, trip.driver_id, changedById],
     );
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "returning" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "returning" });
     return res.json({ success: true });
   } catch (err) {
     console.error("POST /fleet-trips/:id/start-return error:", err);
@@ -4027,16 +3337,7 @@ app.post("/fleet/trips/:id/start", async (req, res) => {
     // Vehicle/driver only go "live" here, at the moment the driver actually
     // starts the trip — not at admin approval time, so the fleet lists
     // (Vehicles/Drivers panels) show idle/unassigned until then.
-    // current_trip_label is a capped-width column, but pickup/dropoff text
-    // can each run up to 150 chars — concatenated, that can exceed the
-    // column's limit and MySQL rejects the whole UPDATE ("Data too long
-    // for column 'current_trip_label'"), which was surfacing as "Advance
-    // trip failed" on the driver's Start Trip button. Truncate to fit.
-    const CURRENT_TRIP_LABEL_MAX = 150;
-    let tripLabel = `${trip.pickup_location_text} → ${trip.dropoff_location_text}`;
-    if (tripLabel.length > CURRENT_TRIP_LABEL_MAX) {
-      tripLabel = tripLabel.slice(0, CURRENT_TRIP_LABEL_MAX - 1) + "…";
-    }
+    const tripLabel = `${trip.pickup_location_text} → ${trip.dropoff_location_text}`;
     if (trip.vehicle_id) {
       await conn.query(
         `UPDATE fleet_vehicles SET
@@ -4109,8 +3410,6 @@ app.post("/fleet/trips/:id/complete", async (req, res) => {
     );
 
     await conn.commit();
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "completed" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "completed" });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -4297,7 +3596,7 @@ app.patch("/fleet/drivers/:id", async (req, res) => {
 app.patch("/fleet/vehicles/:id", async (req, res) => {
   if (!requireAuth(req, res)) return;
   const { id } = req.params;
-  const { plateNumber, type, model, seatingCapacity, tramigoDeviceId } = req.body;
+  const { plateNumber, type, model, seatingCapacity } = req.body;
 
   try {
     const [rows] = await db.query("SELECT * FROM fleet_vehicles WHERE id = ?", [id]);
@@ -4318,14 +3617,13 @@ app.patch("/fleet/vehicles/:id", async (req, res) => {
 
     await db.query(
       `UPDATE fleet_vehicles SET
-         plate_number = ?, type = ?, model = ?, seating_capacity = ?, tramigo_device_id = ?, updated_at = NOW()
+         plate_number = ?, type = ?, model = ?, seating_capacity = ?, updated_at = NOW()
        WHERE id = ?`,
       [
         plateNumber ?? current.plate_number,
         type ?? current.type,
         model ?? current.model,
         seatingCapacity ?? current.seating_capacity,
-        tramigoDeviceId !== undefined ? (tramigoDeviceId || null) : current.tramigo_device_id,
         id,
       ],
     );
@@ -4617,13 +3915,13 @@ app.get("/fleet/vehicles/live-locations", async (req, res) => {
       (Array.isArray(tramigoReports) ? tramigoReports : []).map((r) => [String(r.Device_ID), r]),
     );
 
-    // Vehicle status is driven ONLY by actual trip lifecycle events (see
-    // POST /fleet/trips/:id/start and /complete) — never by raw GPS speed.
-    // A vehicle can be physically moving (someone driving it around,
-    // testing the tracker, etc.) with zero trips booked to it, and it
-    // should still read as available/idle rather than falsely "Active".
-    // GPS reports here are used only for the map position + last_ping_at
-    // ("last seen") — status itself is untouched.
+    // GPS-derived status only ever toggles a vehicle between 'idle' and
+    // 'active' — it never overwrites 'maintenance', 'personal', or
+    // 'off_duty', since those are explicit admin/driver states that a
+    // vehicle simply moving shouldn't silently clear.
+    const AUTO_STATUSES = new Set(["idle", "active"]);
+    const statusUpdates = [];
+
     const locations = vehicles
       .map((v) => {
         const report = byDeviceId.get(String(v.tramigo_device_id));
@@ -4631,6 +3929,19 @@ app.get("/fleet/vehicles/live-locations", async (req, res) => {
         if (!loc) return null;
 
         const speedKmh = loc.Speed != null ? parseFloat(loc.Speed) / 1000 : null;
+        const reportAgeMs = report.DateTime_Actual
+          ? Date.now() - new Date(report.DateTime_Actual).getTime()
+          : null;
+        const isStale = reportAgeMs == null || isNaN(reportAgeMs) || reportAgeMs > STALE_REPORT_THRESHOLD_MS;
+
+        const derivedStatus =
+          !isStale && speedKmh != null && speedKmh > MOVING_SPEED_THRESHOLD_KMH
+            ? "active"
+            : "idle";
+
+        if (AUTO_STATUSES.has(v.status) && v.status !== derivedStatus) {
+          statusUpdates.push({ id: v.id, status: derivedStatus });
+        }
 
         return {
           vehicleId: String(v.id),
@@ -4645,21 +3956,33 @@ app.get("/fleet/vehicles/live-locations", async (req, res) => {
       })
       .filter(Boolean);
 
-    // Every vehicle with a live report gets last_ping_at stamped — this is
-    // a "last seen" signal only, separate from updated_at (which also gets
-    // touched by unrelated manual edits like plate/model changes).
+    // Every vehicle with a live report gets last_ping_at stamped, regardless
+    // of whether its status changed — this is a separate "last seen" signal
+    // from updated_at, which also gets touched by unrelated manual edits
+    // (plate/model changes, admin status overrides, etc).
     const pingedVehicleIds = locations.map((l) => Number(l.vehicleId));
+    const statusUpdateIds = new Set(statusUpdates.map((u) => u.id));
 
-    await Promise.all(
-      pingedVehicleIds.map((id) =>
+    await Promise.all([
+      ...statusUpdates.map(({ id, status }) =>
         db.query(
-          "UPDATE fleet_vehicles SET last_ping_at = NOW() WHERE id = ?",
-          [id],
+          "UPDATE fleet_vehicles SET status = ?, last_ping_at = NOW(), updated_at = NOW() WHERE id = ?",
+          [status, id],
         ).catch((err) =>
-          console.error(`Failed to update last_ping_at for vehicle ${id}:`, err.message),
+          console.error(`Failed to auto-update vehicle ${id} status:`, err.message),
         ),
       ),
-    );
+      ...pingedVehicleIds
+        .filter((id) => !statusUpdateIds.has(id))
+        .map((id) =>
+          db.query(
+            "UPDATE fleet_vehicles SET last_ping_at = NOW() WHERE id = ?",
+            [id],
+          ).catch((err) =>
+            console.error(`Failed to update last_ping_at for vehicle ${id}:`, err.message),
+          ),
+        ),
+    ]);
 
     return res.json({ success: true, locations });
   } catch (err) {

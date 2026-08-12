@@ -28,20 +28,5 @@ services:
       retries: 10
       start_period: 60s
 
-  ngrok:
-    image: ngrok/ngrok:latest
-    restart: always
-    command:
-      - "http"
-      - "backend:3000"
-      - "--url=https://darkness-hardness-effects.ngrok-free.dev"
-      - "--pooling-enabled"
-    environment:
-      NGROK_AUTHTOKEN: 3GD6SXJnEvdR1w40xSk3lf4VPzV_3g6BS4PzHHV71EnpMFt6Z
-    ports:
-      - "4040:4040"
-    depends_on:
-      - backend
-
 volumes:
   mysql_data:
