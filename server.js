@@ -7,6 +7,13 @@ const nodemailer = require("nodemailer");
 const webpush = require("web-push");
 require("dotenv").config();
 
+const { createTripEvent, updateTripEvent, deleteTripEvent } = require("./graphCalendarService");
+
+// POST /fleet/trips/:id/sync-to-my-calendar — pushes the trip event
+// directly to the logged-in user's own Outlook mailbox (via app-permission
+// Graph, targeting their notification_email/email instead of the fixed
+// fleet admin mailbox).
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -618,6 +625,7 @@ async function sendFleetTripAdminNotification({
   departureDatetime,
   purpose,
   passengerCount,
+  replyToMessageId,
 }) {
   try {
     const [rows] = await db.query(
@@ -700,10 +708,10 @@ async function sendFleetTripAdminNotification({
       </div>
     `;
 
-    await transporter.sendMail({
+    const mailOptions = {
       from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
       to: recipients.join(", "),
-      subject: `New Trip Request ${tripRef} — Pending Your Review`,
+      subject: `Re: Trip Request ${tripRef} Received`,
       text: `${requestorName} has submitted a new trip request awaiting your approval.\n\nTrip: ${tripRef}\nPick-up: ${pickupLocationText}\nDrop-off: ${dropoffLocationText}\nType: ${tripType}\nDeparture: ${departureDatetime}\n${purpose ? `Purpose: ${purpose}\n` : ""}\nPlease log in to Silverdab UMS to review.`,
       html: htmlBody,
       attachments: [
@@ -713,7 +721,14 @@ async function sendFleetTripAdminNotification({
           cid: "silverdab-logo",
         },
       ],
-    });
+    };
+
+    if (replyToMessageId) {
+      mailOptions.inReplyTo = replyToMessageId;
+      mailOptions.references = replyToMessageId;
+    }
+
+    await transporter.sendMail(mailOptions);
 
     console.log(`📧 Fleet trip admin notification sent to ${recipients.length} recipient(s) for ${tripRef}`);
   } catch (err) {
@@ -753,9 +768,13 @@ async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage
       `SELECT t.trip_ref, t.pickup_location_text, t.dropoff_location_text,
               t.email_message_id,
               u.username AS requestor_username, u.display_name AS requestor_name,
-              u.notification_email, u.email
+              u.notification_email, u.email,
+              drv.display_name AS driver_name,
+              veh.plate_number AS vehicle_plate, veh.model AS vehicle_model
        FROM fleet_trips t
        JOIN users u ON u.id = t.requestor_id
+       LEFT JOIN users drv ON drv.id = t.driver_id
+       LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
        WHERE t.id = ?`,
       [tripId],
     );
@@ -798,6 +817,18 @@ async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage
               <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Status</td>
               <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: ${statusColor};">${statusLabel}</td>
             </tr>
+            ${trip.vehicle_plate ? `
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Assigned Vehicle</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.vehicle_plate}${trip.vehicle_model ? ` (${trip.vehicle_model})` : ""}</td>
+            </tr>
+            ` : ""}
+            ${trip.driver_name ? `
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Assigned Driver</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.driver_name}</td>
+            </tr>
+            ` : ""}
             ${updatedByName ? `
             <tr>
               <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Updated By</td>
@@ -828,7 +859,7 @@ async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage
       from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
       to: toEmail,
       subject: `Re: Trip Request ${trip.trip_ref} Received`,
-      text: `Dear ${trip.requestor_name},\n\nYour trip request ${trip.trip_ref} status has been updated to: ${statusLabel}.${updatedByName ? ` (by ${updatedByName})` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
+      text: `Dear ${trip.requestor_name},\n\nYour trip request ${trip.trip_ref} status has been updated to: ${statusLabel}.${trip.vehicle_plate ? ` Vehicle: ${trip.vehicle_plate}.` : ""}${trip.driver_name ? ` Driver: ${trip.driver_name}.` : ""}${updatedByName ? ` (by ${updatedByName})` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
@@ -860,9 +891,13 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
     const [tripRows] = await db.query(
       `SELECT t.trip_ref, t.pickup_location_text, t.dropoff_location_text,
               t.email_message_id,
-              u.display_name AS requestor_name
+              u.display_name AS requestor_name,
+              drv.display_name AS driver_name,
+              veh.plate_number AS vehicle_plate, veh.model AS vehicle_model
        FROM fleet_trips t
        JOIN users u ON u.id = t.requestor_id
+       LEFT JOIN users drv ON drv.id = t.driver_id
+       LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
        WHERE t.id = ?`,
       [tripId],
     );
@@ -916,6 +951,18 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
               <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">New Status</td>
               <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: ${statusColor};">${statusLabel}</td>
             </tr>
+            ${trip.vehicle_plate ? `
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Assigned Vehicle</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.vehicle_plate}${trip.vehicle_model ? ` (${trip.vehicle_model})` : ""}</td>
+            </tr>
+            ` : ""}
+            ${trip.driver_name ? `
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Assigned Driver</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${trip.driver_name}</td>
+            </tr>
+            ` : ""}
             ${updatedByName ? `
             <tr>
               <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Updated By</td>
@@ -948,7 +995,7 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
       from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
       to: recipients.join(", "),
       subject: `Re: Trip Request ${trip.trip_ref} Received`,
-      text: `Trip ${trip.trip_ref} (requested by ${trip.requestor_name}) status changed to: ${statusLabel}.${updatedByName ? ` Updated by ${updatedByName}.` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
+      text: `Trip ${trip.trip_ref} (requested by ${trip.requestor_name}) status changed to: ${statusLabel}.${trip.vehicle_plate ? ` Vehicle: ${trip.vehicle_plate}.` : ""}${trip.driver_name ? ` Driver: ${trip.driver_name}.` : ""}${updatedByName ? ` Updated by ${updatedByName}.` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
@@ -1080,9 +1127,11 @@ async function sendFleetTripRequestNotification({
     );
 
     console.log(`📧 Trip confirmation sent to ${toEmail} for ${tripRef}`);
+    return info.messageId;
   } catch (err) {
     console.error("Trip confirmation email failed:", err.message);
     // never throw — a failed email should not break the request flow
+    return null;
   }
 }
 
@@ -3479,6 +3528,130 @@ app.post("/fleet/locations", async (req, res) => {
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+// TEMPORARY — bulk-delete every Outlook event this app has created for
+// fleet trips, then clear outlook_event_id so future syncs start fresh.
+// Hit this once from Postman/curl (with your service token) to clean up
+// the test data shown in the calendar, then remove this route.
+app.post("/fleet/trips/cleanup-calendar-events", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  try {
+    const [rows] = await db.query(
+      "SELECT id, outlook_event_id FROM fleet_trips WHERE outlook_event_id IS NOT NULL",
+    );
+
+    let deleted = 0;
+    let failed = 0;
+
+    for (const row of rows) {
+      try {
+        await deleteTripEvent(row.outlook_event_id);
+        await db.query(
+          "UPDATE fleet_trips SET outlook_event_id = NULL WHERE id = ?",
+          [row.id],
+        );
+        deleted++;
+      } catch (err) {
+        console.error(`Cleanup: failed to delete event for trip ${row.id}:`, err.message);
+        failed++;
+      }
+    }
+
+    return res.json({ success: true, total: rows.length, deleted, failed });
+  } catch (err) {
+    console.error("POST /fleet/trips/cleanup-calendar-events error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/fleet/trips/:id/sync-to-my-calendar", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const { id } = req.params;
+  // Fleet Ops calls all go through the shared service token (see
+  // getServiceToken() in fleetOps.ts), so decoded.username is always
+  // "service" here — same situation as POST /fleet/trips/:id/approve.
+  // The real requester's AD username has to come from the body instead.
+  const requestingUsername = (req.body?.requestingUsername || decoded.username || "")
+    .toLowerCase()
+    .trim();
+
+  try {
+    const [userRows] = await db.query(
+      "SELECT notification_email, email FROM users WHERE username = ?",
+      [requestingUsername],
+    );
+    const targetUpn = userRows[0]?.notification_email || userRows[0]?.email;
+    if (!targetUpn) {
+      return res.status(400).json({ success: false, message: "No email on file for your account." });
+    }
+
+    const [tripRows] = await db.query(
+      `SELECT t.trip_ref AS tripRef, t.pickup_location_text AS pickupLabel,
+              t.dropoff_location_text AS dropoffLabel, t.departure_datetime AS departureDatetime,
+              t.return_datetime AS returnDatetime, t.purpose,
+              req.display_name AS requestorName, veh.plate_number AS vehiclePlate,
+              drv.display_name AS driverName
+       FROM fleet_trips t
+       JOIN users req ON req.id = t.requestor_id
+       LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
+       LEFT JOIN users drv ON drv.id = t.driver_id
+       WHERE t.id = ?`,
+      [id],
+    );
+    if (tripRows.length === 0) {
+      return res.status(404).json({ success: false, message: "Trip not found." });
+    }
+
+    const eventId = await createTripEvent(tripRows[0], targetUpn);
+    await db.query(
+      "UPDATE fleet_trips SET outlook_event_id = ?, outlook_event_upn = ? WHERE id = ?",
+      [eventId, targetUpn, id],
+    );
+    return res.json({ success: true, eventId });
+  } catch (err) {
+    console.error("POST /fleet/trips/:id/sync-to-my-calendar error:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /fleet/trips/:id/remove-from-calendar — deletes the Outlook event
+// this trip was synced to (mailbox + event id captured above), then clears
+// both columns so the trip shows as "not synced" again.
+app.post("/fleet/trips/:id/remove-from-calendar", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const { id } = req.params;
+
+  try {
+    const [rows] = await db.query(
+      "SELECT outlook_event_id, outlook_event_upn FROM fleet_trips WHERE id = ?",
+      [id],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Trip not found." });
+    }
+    const { outlook_event_id, outlook_event_upn } = rows[0];
+    if (!outlook_event_id) {
+      return res.status(400).json({ success: false, message: "This trip isn't synced to a calendar." });
+    }
+
+    await deleteTripEvent(outlook_event_id, outlook_event_upn || undefined);
+
+    await db.query(
+      "UPDATE fleet_trips SET outlook_event_id = NULL, outlook_event_upn = NULL WHERE id = ?",
+      [id],
+    );
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /fleet/trips/:id/remove-from-calendar error:", err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
 // ─── INSERT into server.js, in the "FLEET OPS ROUTES" section ─────────────
 // Place this right ABOVE the existing `app.get("/fleet/trips", ...)` handler.
 // It's the missing counterpart to that GET — creates a new trip request from
@@ -3585,6 +3758,25 @@ app.post("/fleet/trips", async (req, res) => {
 
     await conn.commit();
 
+    // Push to Outlook at booking time (before approval/dispatch).
+    try {
+      const eventId = await createTripEvent({
+        tripRef,
+        pickupLabel: pickupLocationText.trim(),
+        dropoffLabel: dropoffLocationText.trim(),
+        requestorName: requestorName ?? "An employee",
+        purpose,
+        departureDatetime,
+        returnDatetime,
+      });
+      await db.query(
+        "UPDATE fleet_trips SET outlook_event_id = ? WHERE id = ?",
+        [eventId, insertResult.insertId],
+      );
+    } catch (err) {
+      console.error("Outlook calendar sync (booking) failed:", err.message);
+    }
+
     // Mirrors the "notify admins" step on supply request creation — remove
     // this call if you don't want a push notification fired on every booking.
     sendWebPushToAdmins({
@@ -3604,17 +3796,18 @@ app.post("/fleet/trips", async (req, res) => {
       departureDatetime,
       purpose,
       passengerCount,
-    });
-
-    sendFleetTripAdminNotification({
-      requestorName: requestorName ?? "An employee",
-      tripRef,
-      pickupLocationText: pickupLocationText.trim(),
-      dropoffLocationText: dropoffLocationText.trim(),
-      tripType,
-      departureDatetime,
-      purpose,
-      passengerCount,
+    }).then((messageId) => {
+      sendFleetTripAdminNotification({
+        requestorName: requestorName ?? "An employee",
+        tripRef,
+        pickupLocationText: pickupLocationText.trim(),
+        dropoffLocationText: dropoffLocationText.trim(),
+        tripType,
+        departureDatetime,
+        purpose,
+        passengerCount,
+        replyToMessageId: messageId,
+      });
     });
 
     return res.status(201).json({ success: true, tripRef });
@@ -3634,6 +3827,7 @@ app.get("/fleet/trips", async (req, res) => {
   try {
     const [rows] = await db.query(
       `SELECT t.*,
+              t.outlook_event_id AS outlook_event_id,
               req.display_name AS requestor_name,
               veh.plate_number AS vehicle_plate,
               drv.display_name AS driver_name,
@@ -3708,13 +3902,14 @@ app.get("/fleet/trips", async (req, res) => {
       vehiclePlate: r.vehicle_plate,
       driverId: r.driver_id !== null ? String(r.driver_id) : null,
       driverName: r.driver_name,
-      status: r.status,
+     status: r.status,
       rejectedReason: r.rejected_reason,
       approvedByName: r.approved_by_name,
       approvedAt: r.approved_at,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
       statusHistory: historyByTrip[r.id] ?? [],
+      calendarSynced: !!r.outlook_event_id,
     }));
     return res.json({ success: true, count: trips.length, trips });
   } catch (err) {
@@ -3830,6 +4025,33 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
     sendFleetTripStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
     sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
 
+    // Push to Outlook — create on first approval, update on reassignment.
+    try {
+      const [calRows] = await db.query(
+        `SELECT t.trip_ref AS tripRef, t.pickup_location_text AS pickupLabel,
+                t.dropoff_location_text AS dropoffLabel, t.departure_datetime AS departureDatetime,
+                t.return_datetime AS returnDatetime, t.purpose,
+                t.outlook_event_id AS outlookEventId,
+                req.display_name AS requestorName, veh.plate_number AS vehiclePlate,
+                drv.display_name AS driverName
+         FROM fleet_trips t
+         JOIN users req ON req.id = t.requestor_id
+         LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
+         LEFT JOIN users drv ON drv.id = t.driver_id
+         WHERE t.id = ?`,
+        [id],
+      );
+      const calTrip = calRows[0];
+      if (calTrip.outlookEventId) {
+        await updateTripEvent(calTrip.outlookEventId, calTrip);
+      } else {
+        const eventId = await createTripEvent(calTrip);
+        await db.query("UPDATE fleet_trips SET outlook_event_id = ? WHERE id = ?", [eventId, id]);
+      }
+    } catch (err) {
+      console.error("Outlook calendar sync (approve/reassign) failed:", err.message);
+    }
+
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -3864,6 +4086,16 @@ app.post("/fleet/trips/:id/reject", async (req, res) => {
     );
     sendFleetTripStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
     sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
+
+    try {
+      const [tRows] = await db.query("SELECT outlook_event_id FROM fleet_trips WHERE id = ?", [id]);
+      if (tRows[0]?.outlook_event_id) {
+        await deleteTripEvent(tRows[0].outlook_event_id);
+      }
+    } catch (err) {
+      console.error("Outlook calendar sync (reject) failed:", err.message);
+    }
+
     return res.json({ success: true });
   } catch (err) {
     console.error("POST /fleet-trips/:id/reject error:", err);
@@ -3916,6 +4148,16 @@ app.post("/fleet/trips/:id/cancel", async (req, res) => {
     await conn.commit();
     sendFleetTripStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
     sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
+
+    try {
+      const [tRows] = await db.query("SELECT outlook_event_id FROM fleet_trips WHERE id = ?", [id]);
+      if (tRows[0]?.outlook_event_id) {
+        await deleteTripEvent(tRows[0].outlook_event_id);
+      }
+    } catch (err) {
+      console.error("Outlook calendar sync (cancel) failed:", err.message);
+    }
+
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -4056,6 +4298,8 @@ app.post("/fleet/trips/:id/start", async (req, res) => {
     );
 
     await conn.commit();
+    sendFleetTripStatusNotification({ tripId: id, statusKey: "ongoing" });
+    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "ongoing" });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
