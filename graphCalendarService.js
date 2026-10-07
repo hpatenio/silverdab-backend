@@ -92,6 +92,80 @@ function toGraphDateTime(value) {
 
   return null;
 }
+const MONTH_NAMES = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+// Formats a Graph-style wall-clock string ("YYYY-MM-DDTHH:MM:SS") into
+// a display string like "Aug 19 | 7:00 AM". Parses the pieces directly
+// instead of going through `new Date(...)` so no timezone conversion
+// is applied — it's already local wall-clock time.
+function formatDisplayDateTime(graphDateTime) {
+  if (!graphDateTime) return null;
+
+  const [datePart, timePart] = graphDateTime.split("T");
+  if (!datePart || !timePart) return null;
+
+  const [year, month, day] = datePart.split("-").map(Number);
+  const [hourStr, minuteStr] = timePart.split(":");
+  let hour = Number(hourStr);
+  const minute = minuteStr.padStart(2, "0");
+
+  const ampm = hour >= 12 ? "PM" : "AM";
+  hour = hour % 12;
+  if (hour === 0) hour = 12;
+
+  return `${MONTH_NAMES[month - 1]} ${day} | ${hour}:${minute} ${ampm}`;
+}
+
+// ─── Room → mailbox map ─────────────────────────────────────────────────
+const ROOM_MAILBOXES = {
+  "Conference Room": "conference_room@silverdab.com",
+  "Meeting Room 1": "meetingroom_1@silverdab.com",
+  "Meeting Room 2": "meetingroom_2@silverdab.com",
+};
+
+// ─── Room reservation → Graph event payload ────────────────────────────────
+//
+// Expects a reservation shape matching what GET /room-reservations already
+// returns, e.g.:
+//   { roomRef, roomName, bookingDate, startTime, endTime, fullName, email,
+//     guestEmails, agenda, specialRequests, avRequirement, needsWifi }
+function buildRoomEventBody(reservation) {
+  const tz = reservation.timeZone || "Asia/Manila";
+  const start = `${reservation.bookingDate}T${reservation.startTime}`;
+  const end = `${reservation.bookingDate}T${reservation.endTime}`;
+
+  return {
+    subject: [reservation.roomName, reservation.agenda, reservation.fullName]
+      .filter(Boolean)
+      .join(" | "),
+    body: {
+      contentType: "HTML",
+      content: [
+        `<b>Booking #:</b> ${reservation.roomRef}`,
+        `<b>Room:</b> ${reservation.roomName}`,
+        `<b>Booked by:</b> ${reservation.fullName}`,
+        reservation.email ? `<b>Email:</b> ${reservation.email}` : null,
+        Array.isArray(reservation.guestEmails) && reservation.guestEmails.length > 0
+          ? `<b>Guests:</b> ${reservation.guestEmails.join(", ")}`
+          : null,
+        reservation.agenda ? `<b>Agenda:</b> ${reservation.agenda}` : null,
+        reservation.avRequirement && reservation.avRequirement !== "None"
+          ? `<b>AV Requirement:</b> ${reservation.avRequirement}`
+          : null,
+        reservation.needsWifi ? `<b>Wi-Fi needed:</b> Yes` : null,
+        reservation.specialRequests ? `<b>Special Requests:</b> ${reservation.specialRequests}` : null,
+      ]
+        .filter(Boolean)
+        .join("<br/>"),
+    },
+    start: { dateTime: start, timeZone: tz },
+    end: { dateTime: end, timeZone: tz },
+    location: { displayName: reservation.roomName },
+  };
+}
 
 function buildEventBody(trip) {
   const tz = trip.timeZone || "Asia/Manila";
@@ -129,18 +203,20 @@ function buildEventBody(trip) {
     body: {
       contentType: "HTML",
       content: [
-        `<b>Trip #:</b> ${trip.tripRef}`,
-        `<b>Requestor:</b> ${trip.requestorName}`,
-        trip.departureDatetime ? `<b>Departure:</b> ${toGraphDateTime(trip.departureDatetime)}` : null,
-        trip.passengerCount != null ? `<b>Passengers:</b> ${trip.passengerCount}` : null,
-        trip.purpose ? `<b>Purpose:</b> ${trip.purpose}` : null,
-        trip.vehiclePlate ? `<b>Vehicle:</b> ${trip.vehiclePlate}` : null,
-        trip.driverName ? `<b>Driver:</b> ${trip.driverName}` : null,
-        trip.approvedByName ? `<b>Approved by:</b> ${trip.approvedByName}` : null,
-        trip.approvedAt ? `<b>Approved at:</b> ${toGraphDateTime(trip.approvedAt)}` : null,
-      ]
-        .filter(Boolean)
-        .join("<br/>"),
+  `<b>Trip #:</b> ${trip.tripRef}`,
+  `<b>Requestor:</b> ${trip.requestorName}`,
+  `<b>Pick-up Location:</b> ${trip.pickupLabel || "—"}`,
+  `<b>Drop-off Location:</b> ${trip.dropoffLabel || "—"}`,
+  trip.departureDatetime ? `<b>Departure:</b> ${formatDisplayDateTime(toGraphDateTime(trip.departureDatetime))}` : null,
+  trip.purpose ? `<b>Purpose:</b> ${trip.purpose}` : null,
+  trip.passengerCount != null ? `<b>Passengers:</b> ${trip.passengerCount}` : null,
+  trip.vehiclePlate ? `<b>Vehicle:</b> ${trip.vehiclePlate}` : null,
+  trip.driverName ? `<b>Driver:</b> ${trip.driverName}` : null,
+  trip.approvedByName ? `<b>Approved by:</b> ${trip.approvedByName}` : null,
+  trip.approvedAt ? `<b>Approved at:</b> ${formatDisplayDateTime(toGraphDateTime(trip.approvedAt))}` : null,
+]
+  .filter(Boolean)
+  .join("<br/>"),
     },
     start: { dateTime: start, timeZone: tz },
     end: { dateTime: end, timeZone: tz },
@@ -213,4 +289,89 @@ async function deleteTripEvent(eventId, targetUpn = FLEET_ADMIN_UPN) {
   }
 }
 
-module.exports = { createTripEvent, updateTripEvent, deleteTripEvent };
+/**
+ * Creates an Outlook calendar event for a room reservation on the room's
+ * own resource mailbox (conference_room@, meetingroom_1@, meetingroom_2@).
+ * Returns the Graph event ID — store this as room_reservations.outlook_event_id.
+ */
+async function createRoomEvent(reservation) {
+  const targetUpn = ROOM_MAILBOXES[reservation.roomName];
+  if (!targetUpn) {
+    throw new Error(`No mailbox configured for room "${reservation.roomName}".`);
+  }
+
+  const token = await getAccessToken();
+  const eventBody = buildRoomEventBody(reservation);
+  const res = await fetch(`${GRAPH_BASE}/users/${targetUpn}/events`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(eventBody),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Graph createRoomEvent failed: ${res.status} ${text}`);
+  }
+
+  const json = await res.json();
+  return json.id;
+}
+
+/**
+ * Updates an existing room reservation event — call if the booking is edited.
+ */
+async function updateRoomEvent(eventId, reservation) {
+  const targetUpn = ROOM_MAILBOXES[reservation.roomName];
+  if (!targetUpn) {
+    throw new Error(`No mailbox configured for room "${reservation.roomName}".`);
+  }
+
+  const token = await getAccessToken();
+  const res = await fetch(`${GRAPH_BASE}/users/${targetUpn}/events/${eventId}`, {
+    method: "PATCH",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(buildRoomEventBody(reservation)),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Graph updateRoomEvent failed: ${res.status} ${text}`);
+  }
+}
+
+/**
+ * Deletes a room reservation event — call on cancellation.
+ * Swallows 404s (event already gone) so callers don't need to special-case it.
+ */
+async function deleteRoomEvent(eventId, roomName) {
+  const targetUpn = ROOM_MAILBOXES[roomName];
+  if (!targetUpn) {
+    throw new Error(`No mailbox configured for room "${roomName}".`);
+  }
+
+  const token = await getAccessToken();
+  const res = await fetch(`${GRAPH_BASE}/users/${targetUpn}/events/${eventId}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok && res.status !== 404) {
+    const text = await res.text();
+    throw new Error(`Graph deleteRoomEvent failed: ${res.status} ${text}`);
+  }
+}
+
+module.exports = {
+  createTripEvent,
+  updateTripEvent,
+  deleteTripEvent,
+  createRoomEvent,
+  updateRoomEvent,
+  deleteRoomEvent,
+};

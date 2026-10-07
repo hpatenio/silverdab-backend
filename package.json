@@ -1,10 +1,10 @@
 {
   "name": "silverdab-backend",
   "version": "1.0.0",
-  "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
   },
   "keywords": [],
   "author": "",
@@ -12,13 +12,25 @@
   "type": "commonjs",
   "dependencies": {
     "cors": "^2.8.6",
+    "docx": "^9.8.0",
     "dotenv": "^17.4.2",
+    "expo-server-sdk": "^3.10.0",
     "express": "^5.2.1",
     "jsonwebtoken": "^9.0.3",
     "ldapjs": "^3.0.7",
     "mysql2": "^3.6.0",
     "node-fetch": "^2.7.0",
     "nodemailer": "^9.0.3",
+    "pdf-parse": "^1.1.1",
     "web-push": "^3.6.7"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hpatenio/silverdab-backend.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hpatenio/silverdab-backend/issues"
+  },
+  "homepage": "https://github.com/hpatenio/silverdab-backend#readme",
+  "description": ""
 }

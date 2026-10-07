@@ -7,7 +7,23 @@ const nodemailer = require("nodemailer");
 const webpush = require("web-push");
 require("dotenv").config();
 
-const { createTripEvent, updateTripEvent, deleteTripEvent } = require("./graphCalendarService");
+// Loaded defensively — if expo-server-sdk isn't installed yet, native push
+// is disabled instead of crashing the whole server on startup (this bit
+// everyone last time: an uninstalled require() throws before app.listen()).
+let Expo = null;
+let expo = null;
+try {
+  ({ Expo } = require("expo-server-sdk"));
+  expo = new Expo();
+  console.log("📱 Expo push SDK loaded");
+} catch (err) {
+  console.warn("⚠ expo-server-sdk not installed — native app push disabled. Run: npm install expo-server-sdk");
+}
+
+const {
+  createTripEvent, updateTripEvent, deleteTripEvent,
+  createRoomEvent, updateRoomEvent, deleteRoomEvent,
+} = require("./graphCalendarService");
 
 // POST /fleet/trips/:id/sync-to-my-calendar — pushes the trip event
 // directly to the logged-in user's own Outlook mailbox (via app-permission
@@ -57,7 +73,7 @@ if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
 // Silently drops any subscription that's gone stale (expired/unsubscribed
 // in the browser) by deleting it from the DB — same "never throw" pattern
 // as the email senders, since a failed push shouldn't break the request flow.
-async function sendWebPushToAdmins({ title, body, url, permissionColumn }) {
+async function sendWebPushToAdmins({ title, body, url, permissionColumn, permissionColumns }) {
   if (!process.env.VAPID_PUBLIC_KEY) {
     console.warn("🔔 sendWebPushToAdmins: VAPID not configured, skipping");
     return;
@@ -68,9 +84,22 @@ async function sendWebPushToAdmins({ title, body, url, permissionColumn }) {
       JOIN users u ON u.username = ps.username
     `;
     // Superadmins always see everything (same bypass as GET /permissions/me).
-    // Without a permissionColumn, fall back to notifying everyone subscribed.
-    if (permissionColumn) {
-      subsQuery += ` WHERE u.role = 'superadmin' OR u.${permissionColumn} = 1`;
+    // Accepts either a single permissionColumn (legacy) or an array of
+    // permissionColumns (any one of which grants notification) — falls back
+    // to notifying everyone subscribed if neither is given.
+    const columns = permissionColumns ?? (permissionColumn ? [permissionColumn] : []);
+    // Hardcoded allow-list guards against SQL injection since these are
+    // interpolated directly into the query string below.
+    const ALLOWED_COLUMNS = new Set([
+      "perm_it_access", "perm_office_supplies", "perm_office_all_access",
+      "perm_office_dashboard", "perm_office_inventory", "perm_office_supply_request",
+      "perm_office_monthly_report", "perm_office_activity",
+      "perm_fleet_control", "perm_fleet_driver",
+    ]);
+    const safeColumns = columns.filter((c) => ALLOWED_COLUMNS.has(c));
+    if (safeColumns.length > 0) {
+      const orClause = safeColumns.map((c) => `u.${c} = 1`).join(" OR ");
+      subsQuery += ` WHERE u.role = 'superadmin' OR (${orClause})`;
     }
     const [subs] = await db.query(subsQuery);
     console.log(`🔔 sendWebPushToAdmins: found ${subs.length} subscription(s)`);
@@ -138,6 +167,96 @@ async function sendWebPushToUser(username, { title, body, url }) {
     );
   } catch (err) {
     console.error(`🔔 sendWebPushToUser(${username}) failed:`, err.message);
+  }
+}
+
+// Sends a native push notification to ONE specific user via their
+// registered Expo push token(s) — the native-app counterpart to
+// sendWebPushToUser(), used when the driver is on the mobile app rather
+// than a browser tab with a VAPID subscription.
+async function sendExpoPushToUser(username, { title, body, data }) {
+  if (!expo) {
+    console.warn("📱 sendExpoPushToUser: Expo SDK not available, skipping");
+    return;
+  }
+  try {
+    const [tokens] = await db.query(
+      "SELECT token FROM expo_push_tokens WHERE username = ?",
+      [username],
+    );
+    if (tokens.length === 0) {
+      console.log(`📱 sendExpoPushToUser(${username}): no tokens found`);
+      return;
+    }
+
+    const messages = tokens
+      .filter((t) => Expo.isExpoPushToken(t.token))
+      .map((t) => ({ to: t.token, sound: "default", title, body, data: data ?? {} }));
+
+    if (messages.length === 0) return;
+
+    const chunks = expo.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+      const tickets = await expo.sendPushNotificationsAsync(chunk);
+      tickets.forEach((ticket, i) => {
+        if (ticket.status === "error" && ticket.details?.error === "DeviceNotRegistered") {
+          db.query("DELETE FROM expo_push_tokens WHERE token = ?", [chunk[i].to]).catch(() => {});
+        }
+      });
+    }
+    console.log(`📱 sendExpoPushToUser(${username}): sent to ${messages.length} device(s)`);
+  } catch (err) {
+    console.error(`📱 sendExpoPushToUser(${username}) failed:`, err.message);
+  }
+}
+
+// Sends a native push notification to every admin matching the given
+// permission columns (or all admins/superadmins if none given) — the Expo
+// counterpart to sendWebPushToAdmins(), for admins on the mobile app rather
+// than a browser tab.
+async function sendExpoPushToAdmins({ title, body, data, permissionColumn, permissionColumns }) {
+  if (!expo) {
+    console.warn("📱 sendExpoPushToAdmins: Expo SDK not available, skipping");
+    return;
+  }
+  try {
+    let tokensQuery = `
+      SELECT ept.token FROM expo_push_tokens ept
+      JOIN users u ON u.username = ept.username
+    `;
+    const columns = permissionColumns ?? (permissionColumn ? [permissionColumn] : []);
+    const ALLOWED_COLUMNS = new Set([
+      "perm_it_access", "perm_office_supplies", "perm_office_all_access",
+      "perm_office_dashboard", "perm_office_inventory", "perm_office_supply_request",
+      "perm_office_monthly_report", "perm_office_activity",
+      "perm_fleet_control", "perm_fleet_driver",
+    ]);
+    const safeColumns = columns.filter((c) => ALLOWED_COLUMNS.has(c));
+    if (safeColumns.length > 0) {
+      const orClause = safeColumns.map((c) => `u.${c} = 1`).join(" OR ");
+      tokensQuery += ` WHERE u.role = 'superadmin' OR (${orClause})`;
+    }
+    const [tokens] = await db.query(tokensQuery);
+    console.log(`📱 sendExpoPushToAdmins: found ${tokens.length} token(s)`);
+
+    const messages = tokens
+      .filter((t) => Expo.isExpoPushToken(t.token))
+      .map((t) => ({ to: t.token, sound: "default", title, body, data: data ?? {} }));
+
+    if (messages.length === 0) return;
+
+    const chunks = expo.chunkPushNotifications(messages);
+    for (const chunk of chunks) {
+      const tickets = await expo.sendPushNotificationsAsync(chunk);
+      tickets.forEach((ticket, i) => {
+        if (ticket.status === "error" && ticket.details?.error === "DeviceNotRegistered") {
+          db.query("DELETE FROM expo_push_tokens WHERE token = ?", [chunk[i].to]).catch(() => {});
+        }
+      });
+    }
+    console.log(`📱 sendExpoPushToAdmins: sent to ${messages.length} device(s)`);
+  } catch (err) {
+    console.error("📱 sendExpoPushToAdmins failed:", err.message);
   }
 }
 
@@ -259,10 +378,10 @@ async function sendRequestNotification({ requestedById, requestedByName, ticketN
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -274,16 +393,16 @@ async function sendRequestNotification({ requestedById, requestedByName, ticketN
     `;
 
     const info = await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: toEmail,
       subject: `Supply Request ${ticketNumber} Received`,
       text: `Dear ${requestedByName},\n\nYour supply request ${ticketNumber} has been submitted and is pending review.\n\nItems:\n${itemListText}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     });
@@ -367,10 +486,10 @@ async function sendAdminRequestNotification({ requestedByName, ticketNumber, ite
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -382,16 +501,16 @@ async function sendAdminRequestNotification({ requestedByName, ticketNumber, ite
     `;
 
     await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: SUPPLY_REQUEST_NOTIFY_EMAIL,
       subject: `New Supply Request ${ticketNumber} — Pending Your Review`,
       text: `${requestedByName} has submitted a new supply request awaiting your approval.\n\nTicket: ${ticketNumber}\n\nItems:\n${itemListText}\n\nPlease log in to Silverdab UMS to review.`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     });
@@ -471,10 +590,10 @@ async function sendStatusUpdateNotification({ requestId, statusLabel, extraMessa
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -486,16 +605,16 @@ async function sendStatusUpdateNotification({ requestId, statusLabel, extraMessa
     `;
 
     const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: toEmail,
       subject: `Re: Supply Request ${request.ticket_number} Received`,
       text: `Dear ${request.requested_by_name},\n\nYour supply request ${request.ticket_number} status has been updated to: ${statusLabel}.${updatedByName ? ` (by ${updatedByName})` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     };
@@ -577,10 +696,10 @@ async function sendAdminStatusUpdateNotification({ requestId, statusLabel, extra
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -592,16 +711,16 @@ async function sendAdminStatusUpdateNotification({ requestId, statusLabel, extra
     `;
 
     await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: SUPPLY_REQUEST_NOTIFY_EMAIL,
       subject: `Supply Request ${request.ticket_number} — Status Changed to ${statusLabel}`,
       text: `Ticket ${request.ticket_number} (requested by ${request.requested_by_name}) status changed to: ${statusLabel}.${updatedByName ? ` Updated by ${updatedByName}.` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     });
@@ -627,6 +746,14 @@ async function sendFleetTripAdminNotification({
   passengerCount,
   replyToMessageId,
 }) {
+  // Skip admin notification entirely when this is Henrick's own test
+  // bookings — keeps fleet control admins' inboxes from getting flooded
+  // during testing. Matches on display name, case-insensitive.
+  if ((requestorName || "").trim().toLowerCase() === "henrick e. patenio") {
+    console.log(`📧 [skipped, test requestor] fleet trip admin notification for ${tripRef}`);
+    return;
+  }
+
   try {
     const [rows] = await db.query(
       `SELECT notification_email, email FROM users
@@ -694,10 +821,10 @@ async function sendFleetTripAdminNotification({
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -709,16 +836,16 @@ async function sendFleetTripAdminNotification({
     `;
 
     const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: recipients.join(", "),
       subject: `Re: Trip Request ${tripRef} Received`,
       text: `${requestorName} has submitted a new trip request awaiting your approval.\n\nTrip: ${tripRef}\nPick-up: ${pickupLocationText}\nDrop-off: ${dropoffLocationText}\nType: ${tripType}\nDeparture: ${departureDatetime}\n${purpose ? `Purpose: ${purpose}\n` : ""}\nPlease log in to Silverdab UMS to review.`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     };
@@ -841,10 +968,10 @@ async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -856,16 +983,16 @@ async function sendFleetTripStatusNotification({ tripId, statusKey, extraMessage
     `;
 
     const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: toEmail,
       subject: `Re: Trip Request ${trip.trip_ref} Received`,
       text: `Dear ${trip.requestor_name},\n\nYour trip request ${trip.trip_ref} status has been updated to: ${statusLabel}.${trip.vehicle_plate ? ` Vehicle: ${trip.vehicle_plate}.` : ""}${trip.driver_name ? ` Driver: ${trip.driver_name}.` : ""}${updatedByName ? ` (by ${updatedByName})` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     };
@@ -903,6 +1030,14 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
     );
     if (tripRows.length === 0) return;
     const trip = tripRows[0];
+
+    // Same test-requestor skip as sendFleetTripAdminNotification — status
+    // changes on Henrick's test trips fire far more often (every approve/
+    // start/arrive/complete step), so this matters even more here.
+    if ((trip.requestor_name || "").trim().toLowerCase() === "henrick e. patenio") {
+      console.log(`📧 [skipped, test requestor] fleet trip admin status update (${statusKey}) for ${trip.trip_ref}`);
+      return;
+    }
 
     const [rows] = await db.query(
       `SELECT notification_email, email FROM users WHERE perm_fleet_control = 1`,
@@ -977,10 +1112,10 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Regards,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -992,16 +1127,16 @@ async function sendFleetTripAdminStatusNotification({ tripId, statusKey, extraMe
     `;
 
     const mailOptions = {
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: recipients.join(", "),
       subject: `Re: Trip Request ${trip.trip_ref} Received`,
       text: `Trip ${trip.trip_ref} (requested by ${trip.requestor_name}) status changed to: ${statusLabel}.${trip.vehicle_plate ? ` Vehicle: ${trip.vehicle_plate}.` : ""}${trip.driver_name ? ` Driver: ${trip.driver_name}.` : ""}${updatedByName ? ` Updated by ${updatedByName}.` : ""}${extraMessage ? `\n\n${extraMessage}` : ""}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     };
@@ -1092,10 +1227,10 @@ async function sendFleetTripRequestNotification({
             <tr>
               <td style="vertical-align: middle; line-height: 1.6;">
                 Thank you,<br/>
-                <strong>Silverdab Unified Management System</strong>
+                <strong>Silvergraph Unified Management System</strong>
               </td>
               <td style="vertical-align: middle; text-align: right;">
-                <img src="cid:silverdab-logo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
               </td>
             </tr>
           </table>
@@ -1107,16 +1242,16 @@ async function sendFleetTripRequestNotification({
     `;
 
     const info = await transporter.sendMail({
-      from: `"Silverdab Requests" <${process.env.EMAIL_USER}>`,
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
       to: toEmail,
       subject: `Trip Request ${tripRef} Received`,
       text: `Dear ${requestorName},\n\nYour trip request ${tripRef} has been submitted and is pending review.\n\nPick-up: ${pickupLocationText}\nDrop-off: ${dropoffLocationText}\nType: ${tripType}\nDeparture: ${departureDatetime}`,
       html: htmlBody,
       attachments: [
         {
-          filename: "silverdab-logo.png",
-          path: "./assets/silverdab-logo.png",
-          cid: "silverdab-logo",
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
         },
       ],
     });
@@ -1132,6 +1267,93 @@ async function sendFleetTripRequestNotification({
     console.error("Trip confirmation email failed:", err.message);
     // never throw — a failed email should not break the request flow
     return null;
+  }
+}
+
+// Sends a single confirmation email to the person who booked the room —
+// mirrors sendFleetTripRequestNotification()/sendRequestNotification(), but
+// room_reservations already stores the booker's email directly on the row,
+// so there's no users-table lookup needed like the fleet/supply flows.
+async function sendRoomReservationConfirmation({
+  toEmail,
+  fullName,
+  roomRef,
+  roomName,
+  bookingDate,
+  startTime,
+  endTime,
+  agenda,
+}) {
+  try {
+    const htmlBody = `
+      <div style="font-family: Arial, Helvetica, sans-serif; max-width: 560px; margin: 0 auto; color: #1f2937;">
+        <div style="background-color: #1e3a5f; padding: 20px 24px; border-radius: 8px 8px 0 0;">
+          <h2 style="color: #ffffff; margin: 0; font-size: 18px;">Silverdab Room Reservation</h2>
+        </div>
+        <div style="border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px; padding: 24px;">
+          <p style="margin: 0 0 12px 0;">Dear ${fullName},</p>
+          <p style="margin: 0 0 20px 0; line-height: 1.6;">
+            This is to confirm that your room reservation has been successfully booked.
+          </p>
+
+          <table style="width: 100%; border-collapse: collapse; margin-bottom: 20px;">
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Booking Ref</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${roomRef}</td>
+            </tr>
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Room</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${roomName}</td>
+            </tr>
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Date</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${bookingDate}</td>
+            </tr>
+            <tr>
+              <td style="padding: 6px 12px; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px;">Time</td>
+              <td style="padding: 6px 12px; font-weight: bold; text-align: right; color: #1e3a5f;">${startTime} – ${endTime}</td>
+            </tr>
+          </table>
+
+          ${agenda ? `<p style="margin: 0 0 20px 0; line-height: 1.6; color: #374151;"><strong>Agenda:</strong> ${agenda}</p>` : ""}
+
+          <table style="width: 100%; border-collapse: collapse; margin-top: 20px;">
+            <tr>
+              <td style="vertical-align: middle; line-height: 1.6;">
+                Thank you,<br/>
+                <strong>Silvergraph Unified Management System</strong>
+              </td>
+              <td style="vertical-align: middle; text-align: right;">
+                <img src="cid:SilvergraphLogo" alt="Silverdab" style="height: 32px; opacity: 0.85;" />
+              </td>
+            </tr>
+          </table>
+        </div>
+        <p style="font-size: 11px; color: #9ca3af; text-align: center; margin-top: 16px;">
+          This is an automated notification. Please do not reply directly to this email.
+        </p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from: `"Silvergraph Unified Management System" <${process.env.EMAIL_USER}>`,
+      to: toEmail,
+      subject: `Room Reservation ${roomRef} Confirmed`,
+      text: `Dear ${fullName},\n\nYour room reservation ${roomRef} has been confirmed.\n\nRoom: ${roomName}\nDate: ${bookingDate}\nTime: ${startTime} - ${endTime}${agenda ? `\nAgenda: ${agenda}` : ""}`,
+      html: htmlBody,
+      attachments: [
+        {
+          filename: "SilvergraphLogo.png",
+          path: "./assets/SilvergraphLogo.png",
+          cid: "SilvergraphLogo",
+        },
+      ],
+    });
+
+    console.log(`📧 Room reservation confirmation sent to ${toEmail} for ${roomRef}`);
+  } catch (err) {
+    console.error("Room reservation confirmation email failed:", err.message);
+    // never throw — a failed email should not break the booking flow
   }
 }
 
@@ -1185,8 +1407,10 @@ app.post("/users/sync", async (req, res) => {
         `INSERT INTO users
            (username, display_name, email, department, title, phone, role,
             perm_it_inventory, perm_consumables, perm_tickets, perm_office_supplies, perm_it_access,
+            perm_office_all_access, perm_office_dashboard, perm_office_inventory,
+            perm_office_supply_request, perm_office_monthly_report, perm_office_activity,
             created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'employee', 0, 0, 0, 0, 0, NOW(), NOW())
+         VALUES (?, ?, ?, ?, ?, ?, 'employee', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NOW(), NOW())
          ON DUPLICATE KEY UPDATE
            display_name = VALUES(display_name),
            email = VALUES(email),
@@ -1263,16 +1487,23 @@ app.patch("/users/:username/permissions", async (req, res) => {
   catch { return res.status(401).json({ success: false, message: "Invalid token." }); }
 
   const {
-    itAccess, itInventory, consumables, tickets, officeSupplies,
+    itAccess, itInventory, consumables, tickets,
+    officeSupplies, // deprecated, kept for backward compat
+    officeAllAccess, officeDashboard, officeInventory,
+    officeSupplyRequest, officeMonthlyReport, officeActivity,
     fleetControl, fleetDriver,
   } = req.body;
   const username = req.params.username.toLowerCase().trim();
+  console.log("PATCH permissions body:", req.body);
 
   try {
     await db.query(
       `UPDATE users SET
          perm_it_access = ?, perm_it_inventory = ?, perm_consumables = ?,
          perm_tickets = ?, perm_office_supplies = ?,
+         perm_office_all_access = ?, perm_office_dashboard = ?,
+         perm_office_inventory = ?, perm_office_supply_request = ?,
+         perm_office_monthly_report = ?, perm_office_activity = ?,
          perm_fleet_control = ?, perm_fleet_driver = ?, updated_at = NOW()
        WHERE username = ?`,
       [
@@ -1281,6 +1512,12 @@ app.patch("/users/:username/permissions", async (req, res) => {
         consumables ? 1 : 0,
         tickets ? 1 : 0,
         officeSupplies ? 1 : 0,
+        officeAllAccess ? 1 : 0,
+        officeDashboard ? 1 : 0,
+        officeInventory ? 1 : 0,
+        officeSupplyRequest ? 1 : 0,
+        officeMonthlyReport ? 1 : 0,
+        officeActivity ? 1 : 0,
         fleetControl ? 1 : 0,
         fleetDriver ? 1 : 0,
         username,
@@ -1288,6 +1525,7 @@ app.patch("/users/:username/permissions", async (req, res) => {
     );
     return res.json({ success: true });
   } catch (err) {
+    console.error("PATCH /users/:username/permissions error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -1311,7 +1549,7 @@ app.delete("/users", async (req, res) => {
 // ─── GET /users/:username/email-preference ────────────────────────────────
 app.get("/users/:username/email-preference", async (req, res) => {
   if (!requireAuth(req, res)) return;
-  const { username } = req.params;
+  const username = req.params.username.toLowerCase().trim();
   try {
     const [rows] = await db.query(
       "SELECT username, display_name, notification_email FROM users WHERE username = ?",
@@ -2163,39 +2401,23 @@ app.post("/push/unsubscribe", async (req, res) => {
   }
 });
 
-// POST /push/subscribe — save a browser's push subscription
-app.post("/push/subscribe", async (req, res) => {
+// POST /push/expo-token — save a native app's Expo push token
+app.post("/push/expo-token", async (req, res) => {
   const decoded = requireAuth(req, res);
   if (!decoded) return;
 
-  const { subscription } = req.body;
-  if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
-    return res.status(400).json({ success: false, message: "Invalid subscription object." });
+  const { token } = req.body;
+  if (!token || !token.startsWith("ExponentPushToken")) {
+    return res.status(400).json({ success: false, message: "Invalid Expo push token." });
   }
 
   try {
     await db.query(
-      `INSERT INTO push_subscriptions (username, endpoint, p256dh, auth)
-       VALUES (?, ?, ?, ?)
-       ON DUPLICATE KEY UPDATE username = VALUES(username), p256dh = VALUES(p256dh), auth = VALUES(auth)`,
-      [decoded.username.toLowerCase().trim(), subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth],
+      `INSERT INTO expo_push_tokens (username, token)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE username = VALUES(username)`,
+      [decoded.username.toLowerCase().trim(), token],
     );
-    return res.json({ success: true });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-// POST /push/unsubscribe
-app.post("/push/unsubscribe", async (req, res) => {
-  const decoded = requireAuth(req, res);
-  if (!decoded) return;
-
-  const { endpoint } = req.body;
-  if (!endpoint) return res.status(400).json({ success: false, message: "endpoint is required." });
-
-  try {
-    await db.query("DELETE FROM push_subscriptions WHERE endpoint = ?", [endpoint]);
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
@@ -2323,7 +2545,7 @@ const ticketNumber = `SR-${year}-${nextNum}`;
       title: "New Supply Request",
       body: `${requestedByName} submitted ${ticketNumber} (${items.length} item${items.length !== 1 ? "s" : ""})`,
       url: "/supply-requests",
-      permissionColumn: "perm_office_supplies",
+      permissionColumns: ["perm_office_supplies", "perm_office_all_access", "perm_office_supply_request"],
     });
 
     return res.status(201).json({ success: true, ticketNumber });
@@ -2390,6 +2612,11 @@ app.post("/supply-requests/:id/approve", async (req, res) => {
     }
     const request = reqRows[0];
 
+    const [itemRowsForNotif] = await conn.query(
+      "SELECT item_name FROM supply_request_items WHERE request_id = ?",
+      [id],
+    );
+
     // No stock deduction here — items are approved at full requested qty,
     // stock is only deducted once the request is actually marked delivered.
     await conn.query(
@@ -2408,6 +2635,24 @@ app.post("/supply-requests/:id/approve", async (req, res) => {
     await conn.commit();
     sendStatusUpdateNotification({ requestId: id, statusLabel: "Out for Delivery", updatedByName: approvedByName });
     // sendAdminStatusUpdateNotification({ requestId: id, statusLabel: "Out for Delivery", updatedByName: approvedByName });
+    const itemNamesForNotif = itemRowsForNotif.map((r) => r.item_name);
+    const itemSummaryForNotif =
+      itemNamesForNotif.length > 2
+        ? `${itemNamesForNotif.slice(0, 2).join(", ")} +${itemNamesForNotif.length - 2} more`
+        : itemNamesForNotif.join(", ");
+
+    sendWebPushToAdmins({
+      title: "Request Out for Delivery",
+      body: `${request.requested_by_name} — ${itemSummaryForNotif} (${request.ticket_number})`,
+      url: "/supply-requests",
+      permissionColumns: ["perm_office_supplies", "perm_office_all_access", "perm_office_supply_request"],
+    });
+    sendExpoPushToAdmins({
+      title: "Request Out for Delivery",
+      body: `${request.requested_by_name} — ${itemSummaryForNotif} (${request.ticket_number})`,
+      data: { requestId: id, url: "/supply-requests" },
+      permissionColumns: ["perm_office_supplies", "perm_office_all_access", "perm_office_supply_request"],
+    });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -2437,6 +2682,11 @@ app.post("/supply-requests/:id/approve-partial", async (req, res) => {
       return res.status(404).json({ success: false, message: "Request not found" });
     }
     const request = reqRows[0];
+
+    const [itemRowsForNotif] = await conn.query(
+      "SELECT item_name FROM supply_request_items WHERE request_id = ?",
+      [id],
+    );
 
     const approvedItemIds = [];
     for (const line of lines) {
@@ -2477,6 +2727,24 @@ app.post("/supply-requests/:id/approve-partial", async (req, res) => {
     await conn.commit();
     sendStatusUpdateNotification({ requestId: id, statusLabel: "Out for Delivery", updatedByName: approvedByName });
     // sendAdminStatusUpdateNotification({ requestId: id, statusLabel: "Out for Delivery", updatedByName: approvedByName });
+    const itemNamesForNotif = itemRowsForNotif.map((r) => r.item_name);
+    const itemSummaryForNotif =
+      itemNamesForNotif.length > 2
+        ? `${itemNamesForNotif.slice(0, 2).join(", ")} +${itemNamesForNotif.length - 2} more`
+        : itemNamesForNotif.join(", ");
+
+    sendWebPushToAdmins({
+      title: "Request Out for Delivery",
+      body: `${request.requested_by_name} — ${itemSummaryForNotif} (${request.ticket_number})`,
+      url: "/supply-requests",
+      permissionColumns: ["perm_office_supplies", "perm_office_all_access", "perm_office_supply_request"],
+    });
+    sendExpoPushToAdmins({
+      title: "Request Out for Delivery",
+      body: `${request.requested_by_name} — ${itemSummaryForNotif} (${request.ticket_number})`,
+      data: { requestId: id, url: "/supply-requests" },
+      permissionColumns: ["perm_office_supplies", "perm_office_all_access", "perm_office_supply_request"],
+    });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -3443,6 +3711,9 @@ app.get("/fleet/drivers", async (req, res) => {
       vehicleId: r.vehicle_id !== null ? String(r.vehicle_id) : null,
       vehiclePlate: r.vehicle_plate,
       dutyStatus: r.duty_status ?? "off_duty",
+      dutyStatusUpdatedAt: r.updated_at ?? null,
+      shiftStart: r.shift_start ?? null,
+      shiftEnd: r.shift_end ?? null,
     }));
     return res.json({ success: true, count: drivers.length, drivers });
   } catch (err) {
@@ -3673,8 +3944,13 @@ app.post("/fleet/trips", async (req, res) => {
     requestorName,
     pickupLocationId,
     pickupLocationText,
+    pickupLatitude,
+    pickupLongitude,
     dropoffLocationId,
     dropoffLocationText,
+    dropoffLatitude,
+    dropoffLongitude,
+    additionalDropoffs, // [{ locationId?, locationText, latitude, longitude }, ...]
     tripType,
     departureDatetime,
     returnDatetime,
@@ -3694,6 +3970,22 @@ app.post("/fleet/trips", async (req, res) => {
       success: false,
       message:
         "requestorId, pickup/dropoff locations, tripType, and departureDatetime are required.",
+    });
+  }
+
+  // Coordinates are required at booking time so the Control Tower's route
+  // map always has a pin to draw — older trips predating this check can
+  // still have null lat/lng, but no new trip should.
+  if (
+    pickupLatitude == null ||
+    pickupLongitude == null ||
+    dropoffLatitude == null ||
+    dropoffLongitude == null
+  ) {
+    return res.status(400).json({
+      success: false,
+      message:
+        "Pickup and drop-off must be selected from the map/search suggestions so their coordinates are captured.",
     });
   }
 
@@ -3727,17 +4019,22 @@ app.post("/fleet/trips", async (req, res) => {
     const [insertResult] = await conn.query(
       `INSERT INTO fleet_trips
         (trip_ref, requestor_id, pickup_location_id, pickup_location_text,
-         dropoff_location_id, dropoff_location_text, trip_type,
-         departure_datetime, return_datetime, purpose, passenger_count,
+         pickup_latitude, pickup_longitude,
+         dropoff_location_id, dropoff_location_text, dropoff_latitude, dropoff_longitude,
+         trip_type, departure_datetime, return_datetime, purpose, passenger_count,
          passenger_names, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       [
         tripRef,
         requestorUserId,
         pickupLocationId ?? null,
         pickupLocationText.trim(),
+        pickupLatitude ?? null,
+        pickupLongitude ?? null,
         dropoffLocationId ?? null,
         dropoffLocationText.trim(),
+        dropoffLatitude ?? null,
+        dropoffLongitude ?? null,
         tripType,
         departureDatetime,
         returnDatetime ?? null,
@@ -3755,6 +4052,27 @@ app.post("/fleet/trips", async (req, res) => {
       "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, created_at) VALUES (?, 'pending', ?, ?)",
       [insertResult.insertId, requestorUserId, nowStr],
     );
+
+    // Extra drop-off stops beyond the primary one — stored in order so a
+    // multi-stop trip's route can be reconstructed and displayed later.
+    if (Array.isArray(additionalDropoffs) && additionalDropoffs.length > 0) {
+      for (let i = 0; i < additionalDropoffs.length; i++) {
+        const stop = additionalDropoffs[i];
+        await conn.query(
+          `INSERT INTO fleet_trip_stops
+            (trip_id, stop_order, location_id, location_text, latitude, longitude, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+          [
+            insertResult.insertId,
+            i + 2, // 1 = primary dropoff, 2+ = additional stops in order
+            stop.locationId ?? null,
+            stop.locationText,
+            stop.latitude,
+            stop.longitude,
+          ],
+        );
+      }
+    }
 
     await conn.commit();
 
@@ -3821,9 +4139,11 @@ app.post("/fleet/trips", async (req, res) => {
 });
 
 
-// GET /fleet/trips
+// GET /fleet/trips — ?includeArchived=true also returns archived trips
+// (default excludes them, mirrors GET /supply-requests).
 app.get("/fleet/trips", async (req, res) => {
   if (!requireAuth(req, res)) return;
+  const includeArchived = req.query.includeArchived === "true";
   try {
     const [rows] = await db.query(
       `SELECT t.*,
@@ -3837,11 +4157,29 @@ app.get("/fleet/trips", async (req, res) => {
        LEFT JOIN fleet_vehicles veh  ON veh.id = t.vehicle_id
        LEFT JOIN users drv           ON drv.id = t.driver_id
        LEFT JOIN users apr           ON apr.id = t.approved_by
+       ${includeArchived ? "" : "WHERE t.is_archived = 0"}
        ORDER BY t.departure_datetime DESC`,
     );
 
     const tripIds = rows.map((r) => r.id);
     let historyByTrip = {};
+    let stopsByTrip = {};
+    if (tripIds.length > 0) {
+      const [stopRows] = await db.query(
+        `SELECT trip_id, stop_order, location_id, location_text, latitude, longitude
+         FROM fleet_trip_stops WHERE trip_id IN (?) ORDER BY stop_order ASC`,
+        [tripIds],
+      );
+      stopsByTrip = stopRows.reduce((acc, row) => {
+        (acc[row.trip_id] ??= []).push({
+          locationId: row.location_id !== null ? String(row.location_id) : null,
+          locationText: row.location_text,
+          latitude: row.latitude !== null ? Number(row.latitude) : null,
+          longitude: row.longitude !== null ? Number(row.longitude) : null,
+        });
+        return acc;
+      }, {});
+    }
     if (tripIds.length > 0) {
       const [logRows] = await db.query(
         `SELECT
@@ -3884,8 +4222,12 @@ app.get("/fleet/trips", async (req, res) => {
       requestorName: r.requestor_name,
       pickupLocationId: r.pickup_location_id !== null ? String(r.pickup_location_id) : null,
       pickupLabel: r.pickup_location_text,
+      pickupLatitude: r.pickup_latitude !== null ? Number(r.pickup_latitude) : null,
+      pickupLongitude: r.pickup_longitude !== null ? Number(r.pickup_longitude) : null,
       dropoffLocationId: r.dropoff_location_id !== null ? String(r.dropoff_location_id) : null,
       dropoffLabel: r.dropoff_location_text,
+      dropoffLatitude: r.dropoff_latitude !== null ? Number(r.dropoff_latitude) : null,
+      dropoffLongitude: r.dropoff_longitude !== null ? Number(r.dropoff_longitude) : null,
       tripType: r.trip_type,
       departureDatetime: r.departure_datetime,
       returnDatetime: r.return_datetime,
@@ -3909,11 +4251,52 @@ app.get("/fleet/trips", async (req, res) => {
       createdAt: r.created_at,
       updatedAt: r.updated_at,
       statusHistory: historyByTrip[r.id] ?? [],
+      // Extra stops beyond the primary dropoff, in visit order.
+      additionalDropoffs: stopsByTrip[r.id] ?? [],
       calendarSynced: !!r.outlook_event_id,
+      isArchived: !!r.is_archived,
     }));
     return res.json({ success: true, count: trips.length, trips });
   } catch (err) {
     console.error("GET /fleet-trips error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /fleet/trips/:id/archive — hide from default list without deleting
+app.post("/fleet/trips/:id/archive", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { id } = req.params;
+  try {
+    const [result] = await db.query(
+      "UPDATE fleet_trips SET is_archived = 1 WHERE id = ?",
+      [id],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Trip not found" });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /fleet/trips/:id/archive error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /fleet/trips/:id/unarchive — undo
+app.post("/fleet/trips/:id/unarchive", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { id } = req.params;
+  try {
+    const [result] = await db.query(
+      "UPDATE fleet_trips SET is_archived = 0 WHERE id = ?",
+      [id],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Trip not found" });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /fleet/trips/:id/unarchive error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -3987,11 +4370,10 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
       [vehicleId, driverUserId],
     );
 
-    // Only write a status-log row on the FIRST approval. Reassigning the
-    // vehicle/driver on a trip that's already approved/arrived hits this
-    // same route again, but it isn't a new status transition — logging it
-    // every time was producing duplicate "Approved" entries in the status
-    // history whenever dispatch swapped a vehicle or driver.
+    // Reassigning the vehicle/driver on a trip that's already approved/
+    // arrived hits this same route again — it isn't a new status
+    // transition, so it's logged at the trip's actual current status with
+    // a descriptive note instead of a bare duplicate "Approved" entry.
     const wasAlreadyApproved = trip.status === "approved" || trip.status === "arrived";
     if (!wasAlreadyApproved) {
       await conn.query(
@@ -3999,7 +4381,17 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
          VALUES (?, 'approved', ?, ?, ?, NULL, NOW())`,
         [id, vehicleId, driverUserId, approvedById],
       );
+    } else {
+      const [vehRows] = await conn.query("SELECT plate_number FROM fleet_vehicles WHERE id = ?", [vehicleId]);
+      const [drvRows] = await conn.query("SELECT display_name FROM users WHERE id = ?", [driverUserId]);
+      const note = `Reassigned to ${vehRows[0]?.plate_number ?? "vehicle"} / ${drvRows[0]?.display_name ?? "driver"}`;
+      await conn.query(
+        `INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, note, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [id, trip.status, vehicleId, driverUserId, approvedById, note],
+      );
     }
+    var wasReassignment = wasAlreadyApproved;
 
     await conn.commit();
 
@@ -4017,13 +4409,22 @@ app.post("/fleet/trips/:id/approve", async (req, res) => {
           body: `You've been assigned to ${trip.trip_ref} (${trip.pickup_location_text} → ${trip.dropoff_location_text})`,
           url: "/driver-portal",
         });
+        sendExpoPushToUser(driverUsername, {
+          title: "New Trip Assigned",
+          body: `You've been assigned to ${trip.trip_ref} (${trip.pickup_location_text} → ${trip.dropoff_location_text})`,
+          data: { tripId: id, url: "/driver-portal" },
+        });
       }
     } catch (err) {
       console.error("Driver trip-assignment push failed:", err.message);
     }
 
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
+    if (wasReassignment) {
+      const noteText = `Vehicle and driver reassigned by dispatch.`;
+      sendFleetTripStatusNotification({ tripId: id, statusKey: trip.status, extraMessage: noteText, updatedByName: approvedByDisplayName });
+    } else {
+      sendFleetTripStatusNotification({ tripId: id, statusKey: "approved", updatedByName: approvedByDisplayName });
+    }
 
     // Push to Outlook — create on first approval, update on reassignment.
     try {
@@ -4085,7 +4486,6 @@ app.post("/fleet/trips/:id/reject", async (req, res) => {
       [id, reason ?? "", changedById],
     );
     sendFleetTripStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "rejected", extraMessage: reason });
 
     try {
       const [tRows] = await db.query("SELECT outlook_event_id FROM fleet_trips WHERE id = ?", [id]);
@@ -4103,8 +4503,14 @@ app.post("/fleet/trips/:id/reject", async (req, res) => {
   }
 });
 
-// POST /fleet/trips/:id/cancel — employee-initiated, only while the trip
-// hasn't been approved yet. Mirrors POST /supply-requests/:id/cancel.
+// POST /fleet/trips/:id/cancel — employee-initiated while pending, OR
+// admin-initiated (from the Control Tower) while approved. Mirrors
+// POST /supply-requests/:id/cancel. If the trip was already approved and
+// had a vehicle/driver attached, both are released back to available —
+// same release logic as /arrive and /complete — since a cancelled trip
+// should never leave a vehicle "stuck" on it.
+const CANCELLABLE_STATUSES = ["pending", "approved", "arrived"];
+
 app.post("/fleet/trips/:id/cancel", async (req, res) => {
   const decoded = requireAuth(req, res);
   if (!decoded) return;
@@ -4116,19 +4522,20 @@ app.post("/fleet/trips/:id/cancel", async (req, res) => {
     await conn.beginTransaction();
 
     const [rows] = await conn.query(
-      "SELECT status FROM fleet_trips WHERE id = ? FOR UPDATE",
+      "SELECT * FROM fleet_trips WHERE id = ? FOR UPDATE",
       [id],
     );
     if (rows.length === 0) {
       await conn.rollback();
       return res.status(404).json({ success: false, message: "Trip not found" });
     }
+    const trip = rows[0];
 
-    if (rows[0].status !== "pending") {
+    if (!CANCELLABLE_STATUSES.includes(trip.status)) {
       await conn.rollback();
       return res.status(409).json({
         success: false,
-        message: "This trip has already been reviewed and can no longer be cancelled.",
+        message: "This trip can no longer be cancelled.",
       });
     }
 
@@ -4137,22 +4544,31 @@ app.post("/fleet/trips/:id/cancel", async (req, res) => {
       [id],
     );
 
+    if (trip.vehicle_id) {
+      await conn.query(
+        "UPDATE fleet_vehicles SET status = 'idle', current_trip_label = NULL, assigned_driver_id = NULL, updated_at = NOW() WHERE id = ?",
+        [trip.vehicle_id],
+      );
+      await conn.query(
+        "UPDATE fleet_drivers SET vehicle_id = NULL, updated_at = NOW() WHERE vehicle_id = ?",
+        [trip.vehicle_id],
+      );
+    }
+
     const [changerRows] = await conn.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
     const changedById = changerRows[0]?.id ?? null;
 
     await conn.query(
-      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, created_at) VALUES (?, 'cancelled', ?, NOW())",
-      [id, changedById],
+      "INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, created_at) VALUES (?, 'cancelled', ?, ?, ?, NOW())",
+      [id, trip.vehicle_id, trip.driver_id, changedById],
     );
 
     await conn.commit();
     sendFleetTripStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "cancelled", updatedByName: cancelledByName });
 
     try {
-      const [tRows] = await db.query("SELECT outlook_event_id FROM fleet_trips WHERE id = ?", [id]);
-      if (tRows[0]?.outlook_event_id) {
-        await deleteTripEvent(tRows[0].outlook_event_id);
+      if (trip.outlook_event_id) {
+        await deleteTripEvent(trip.outlook_event_id);
       }
     } catch (err) {
       console.error("Outlook calendar sync (cancel) failed:", err.message);
@@ -4168,38 +4584,280 @@ app.post("/fleet/trips/:id/cancel", async (req, res) => {
   }
 });
 
+// PATCH /fleet/trips/:id/dropoffs — admin edits the trip's drop-off set:
+// the primary destination (dropoffLabel/Location/lat/lng) and/or the
+// additional-stops list. Replaces fleet_trip_stops wholesale for this trip
+// (delete + reinsert) since stop order/removal is easiest to express that
+// way, same pattern as PUT /dropdown-configs.
+app.patch("/fleet/trips/:id/dropoffs", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  const { id } = req.params;
+  const {
+    dropoffLocationId,
+    dropoffLabel,
+    dropoffLatitude,
+    dropoffLongitude,
+    additionalDropoffs,
+  } = req.body;
+
+  if (!dropoffLabel?.trim()) {
+    return res.status(400).json({ success: false, message: "dropoffLabel is required." });
+  }
+  if (!Array.isArray(additionalDropoffs)) {
+    return res.status(400).json({ success: false, message: "additionalDropoffs array is required." });
+  }
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [tripRows] = await conn.query("SELECT id, outlook_event_id FROM fleet_trips WHERE id = ? FOR UPDATE", [id]);
+    if (tripRows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Trip not found." });
+    }
+
+    await conn.query(
+      `UPDATE fleet_trips SET
+         dropoff_location_id = ?, dropoff_location_text = ?,
+         dropoff_latitude = ?, dropoff_longitude = ?, updated_at = NOW()
+       WHERE id = ?`,
+      [
+        dropoffLocationId ?? null,
+        dropoffLabel.trim(),
+        dropoffLatitude ?? null,
+        dropoffLongitude ?? null,
+        id,
+      ],
+    );
+
+    await conn.query("DELETE FROM fleet_trip_stops WHERE trip_id = ?", [id]);
+
+    for (let i = 0; i < additionalDropoffs.length; i++) {
+      const stop = additionalDropoffs[i];
+      await conn.query(
+        `INSERT INTO fleet_trip_stops
+          (trip_id, stop_order, location_id, location_text, latitude, longitude, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, NOW())`,
+        [
+          id,
+          i + 2, // 1 = primary dropoff, 2+ = additional stops in order
+          stop.locationId ?? null,
+          stop.locationText,
+          stop.latitude ?? null,
+          stop.longitude ?? null,
+        ],
+      );
+    }
+
+    const [changerRows] = await conn.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
+    const changedById = changerRows[0]?.id ?? null;
+    await conn.query(
+      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, note, created_at) VALUES (?, (SELECT status FROM fleet_trips WHERE id = ?), ?, 'Drop-offs updated', NOW())",
+      [id, id, changedById],
+    );
+
+    const [statusRow] = await conn.query("SELECT status FROM fleet_trips WHERE id = ?", [id]);
+    const currentTripStatus = statusRow[0]?.status;
+
+    await conn.commit();
+
+    sendFleetTripStatusNotification({
+      tripId: id,
+      statusKey: currentTripStatus,
+      extraMessage: `Your trip's drop-off details have been updated.`,
+    });
+
+    // Keep Outlook in sync if this trip already has a calendar event.
+    const outlookEventId = tripRows[0].outlook_event_id;
+    if (outlookEventId) {
+      try {
+        const [calRows] = await db.query(
+          `SELECT t.trip_ref AS tripRef, t.pickup_location_text AS pickupLabel,
+                  t.dropoff_location_text AS dropoffLabel, t.departure_datetime AS departureDatetime,
+                  t.return_datetime AS returnDatetime, t.purpose,
+                  req.display_name AS requestorName, veh.plate_number AS vehiclePlate,
+                  drv.display_name AS driverName
+           FROM fleet_trips t
+           JOIN users req ON req.id = t.requestor_id
+           LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
+           LEFT JOIN users drv ON drv.id = t.driver_id
+           WHERE t.id = ?`,
+          [id],
+        );
+        if (calRows[0]) {
+          await updateTripEvent(outlookEventId, calRows[0]);
+        }
+      } catch (err) {
+        console.error("Outlook calendar sync (dropoffs update) failed:", err.message);
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    await conn.rollback();
+    console.error("PATCH /fleet-trips/:id/dropoffs error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// PATCH /fleet/trips/:id/reschedule — employee-initiated, only while the
+// trip hasn't been approved yet (same gate as cancel above). Only moves
+// departureDatetime/returnDatetime; everything else about the trip is
+// untouched. Also pushes the updated time to Outlook if the trip was
+// already synced to a calendar event.
+app.patch("/fleet/trips/:id/reschedule", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  const { id } = req.params;
+  const { departureDatetime, returnDatetime } = req.body;
+
+  if (!departureDatetime) {
+    return res.status(400).json({ success: false, message: "departureDatetime is required." });
+  }
+
+  // Allowed while pending (employee-initiated, before dispatch has looked
+  // at it) or approved (admin-initiated, from the Control Tower — the trip
+  // already has a vehicle/driver assigned, this only moves its time).
+  const RESCHEDULABLE_STATUSES = ["pending", "approved"];
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query(
+      "SELECT status, outlook_event_id FROM fleet_trips WHERE id = ? FOR UPDATE",
+      [id],
+    );
+    if (rows.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "Trip not found" });
+    }
+
+    const currentStatus = rows[0].status;
+    if (!RESCHEDULABLE_STATUSES.includes(currentStatus)) {
+      await conn.rollback();
+      return res.status(409).json({
+        success: false,
+        message: "This trip can no longer be rescheduled.",
+      });
+    }
+
+    await conn.query(
+      "UPDATE fleet_trips SET departure_datetime = ?, return_datetime = ?, updated_at = NOW() WHERE id = ?",
+      [departureDatetime, returnDatetime ?? null, id],
+    );
+
+    const [changerRows] = await conn.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
+    const changedById = changerRows[0]?.id ?? null;
+
+    // Log at the trip's ACTUAL current status, not a hardcoded 'pending' —
+    // an approved trip stays approved after an admin reschedules it, this
+    // is a time change, not a status transition.
+    const noteText = currentStatus === "approved" ? "Rescheduled by dispatch" : "Rescheduled by requestor";
+    await conn.query(
+      "INSERT INTO fleet_trip_status_log (trip_id, status, changed_by, note, created_at) VALUES (?, ?, ?, ?, NOW())",
+      [id, currentStatus, changedById, noteText],
+    );
+
+    await conn.commit();
+
+    sendFleetTripStatusNotification({
+      tripId: id,
+      statusKey: currentStatus,
+      extraMessage: `Your trip has been rescheduled to ${departureDatetime}.`,
+    });
+
+    const outlookEventId = rows[0].outlook_event_id;
+    if (outlookEventId) {
+      try {
+        const [calRows] = await db.query(
+          `SELECT t.trip_ref AS tripRef, t.pickup_location_text AS pickupLabel,
+                  t.dropoff_location_text AS dropoffLabel, t.departure_datetime AS departureDatetime,
+                  t.return_datetime AS returnDatetime, t.purpose,
+                  req.display_name AS requestorName, veh.plate_number AS vehiclePlate,
+                  drv.display_name AS driverName
+           FROM fleet_trips t
+           JOIN users req ON req.id = t.requestor_id
+           LEFT JOIN fleet_vehicles veh ON veh.id = t.vehicle_id
+           LEFT JOIN users drv ON drv.id = t.driver_id
+           WHERE t.id = ?`,
+          [id],
+        );
+        if (calRows[0]) {
+          await updateTripEvent(outlookEventId, calRows[0]);
+        }
+      } catch (err) {
+        console.error("Outlook calendar sync (reschedule) failed:", err.message);
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    await conn.rollback();
+    console.error("PATCH /fleet-trips/:id/reschedule error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
 // POST /fleet/trips/:id/arrive
+// "Arrive" now completes the trip outright — no separate returning/mark-
+// completed step. Mirrors the vehicle/driver-release logic from
+// POST /fleet/trips/:id/complete, since that's effectively what this does now.
 app.post("/fleet/trips/:id/arrive", async (req, res) => {
   const decoded = requireAuth(req, res);
   if (!decoded) return;
   const { id } = req.params;
+
+  const conn = await db.getConnection();
   try {
-    const [tripRows] = await db.query("SELECT vehicle_id, driver_id FROM fleet_trips WHERE id = ?", [id]);
+    await conn.beginTransaction();
+
+    const [tripRows] = await conn.query("SELECT * FROM fleet_trips WHERE id = ? FOR UPDATE", [id]);
     if (tripRows.length === 0) {
+      await conn.rollback();
       return res.status(404).json({ success: false, message: "Trip not found." });
     }
     const trip = tripRows[0];
 
-    const [result] = await db.query(
-      "UPDATE fleet_trips SET status = 'arrived', updated_at = NOW() WHERE id = ?",
+    await conn.query(
+      "UPDATE fleet_trips SET status = 'completed', updated_at = NOW() WHERE id = ?",
       [id],
     );
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ success: false, message: "Trip not found." });
+
+    if (trip.vehicle_id) {
+      await conn.query(
+        "UPDATE fleet_vehicles SET status = 'idle', current_trip_label = NULL, assigned_driver_id = NULL, updated_at = NOW() WHERE id = ?",
+        [trip.vehicle_id],
+      );
+      await conn.query(
+        "UPDATE fleet_drivers SET vehicle_id = NULL, updated_at = NOW() WHERE vehicle_id = ?",
+        [trip.vehicle_id],
+      );
     }
-    const [changerRows] = await db.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
+
+    const [changerRows] = await conn.query("SELECT id FROM users WHERE username = ?", [decoded.username]);
     const changedById = changerRows[0]?.id ?? null;
 
-    await db.query(
-      "INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, created_at) VALUES (?, 'arrived', ?, ?, ?, NOW())",
+    await conn.query(
+      "INSERT INTO fleet_trip_status_log (trip_id, status, vehicle_id, driver_id, changed_by, created_at) VALUES (?, 'completed', ?, ?, ?, NOW())",
       [id, trip.vehicle_id, trip.driver_id, changedById],
     );
-    sendFleetTripStatusNotification({ tripId: id, statusKey: "arrived" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "arrived" });
+
+    await conn.commit();
+    sendFleetTripStatusNotification({ tripId: id, statusKey: "completed" });
     return res.json({ success: true });
   } catch (err) {
+    await conn.rollback();
     console.error("POST /fleet-trips/:id/arrive error:", err);
     return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
   }
 });
 // POST /fleet/trips/:id/start-return
@@ -4229,7 +4887,6 @@ app.post("/fleet/trips/:id/start-return", async (req, res) => {
       [id, trip.vehicle_id, trip.driver_id, changedById],
     );
     sendFleetTripStatusNotification({ tripId: id, statusKey: "returning" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "returning" });
     return res.json({ success: true });
   } catch (err) {
     console.error("POST /fleet-trips/:id/start-return error:", err);
@@ -4299,7 +4956,6 @@ app.post("/fleet/trips/:id/start", async (req, res) => {
 
     await conn.commit();
     sendFleetTripStatusNotification({ tripId: id, statusKey: "ongoing" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "ongoing" });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -4354,7 +5010,6 @@ app.post("/fleet/trips/:id/complete", async (req, res) => {
 
     await conn.commit();
     sendFleetTripStatusNotification({ tripId: id, statusKey: "completed" });
-    sendFleetTripAdminStatusNotification({ tripId: id, statusKey: "completed" });
     return res.json({ success: true });
   } catch (err) {
     await conn.rollback();
@@ -4723,14 +5378,43 @@ app.delete("/fleet/locations/:id", async (req, res) => {
 app.patch("/fleet/drivers/:id/duty-status", async (req, res) => {
   if (!requireAuth(req, res)) return;
   const { id } = req.params;
-  const { dutyStatus } = req.body;
+  let { dutyStatus } = req.body;
 
-  const ALLOWED = ["off_duty", "active", "personal"];
+  const ALLOWED = ["off_duty", "active", "personal", "leave"];
   if (!ALLOWED.includes(dutyStatus)) {
     return res.status(400).json({ success: false, message: `Invalid dutyStatus "${dutyStatus}".` });
   }
 
+  // Weekends are non-working days — force off_duty regardless of what the
+  // client sent, using local server time (0 = Sunday, 6 = Saturday).
+  // Exception: "leave" is an explicit admin override (e.g. driver is on
+  // leave) and should never be silently downgraded by the weekend check.
+  const dayOfWeek = new Date().getDay();
+  if (dutyStatus !== "leave" && (dayOfWeek === 0 || dayOfWeek === 6)) {
+    dutyStatus = "off_duty";
+  }
+
   try {
+    const [driverRows] = await db.query("SELECT user_id FROM fleet_drivers WHERE id = ?", [id]);
+    if (driverRows.length === 0) {
+      return res.status(404).json({ success: false, message: "Driver not found." });
+    }
+
+    // Shift-based auto-sync (see computeAutoDutyStatus in shiftUtils.ts) can
+    // fire this with "off_duty" purely because the shift window ended, even
+    // though the driver is still mid-trip. A driver actually on an ongoing
+    // trip should keep reading as on-trip/active until the trip itself is
+    // completed — so block any downgrade to off_duty while one exists.
+    if (dutyStatus === "off_duty") {
+      const [tripRows] = await db.query(
+        "SELECT id FROM fleet_trips WHERE driver_id = ? AND status = 'ongoing' LIMIT 1",
+        [driverRows[0].user_id],
+      );
+      if (tripRows.length > 0) {
+        return res.json({ success: true, skipped: true, reason: "Driver is on an ongoing trip." });
+      }
+    }
+
     const [result] = await db.query(
       "UPDATE fleet_drivers SET duty_status = ?, updated_at = NOW() WHERE id = ?",
       [dutyStatus, id],
@@ -4741,6 +5425,34 @@ app.patch("/fleet/drivers/:id/duty-status", async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error("PATCH /fleet/drivers/:id/duty-status error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PATCH /fleet/drivers/:id/shift — assigns one of the 3 fixed shift windows.
+// On/off duty is no longer set by hand for this: the client derives it from
+// (shift_start, shift_end) vs. the current time — see computeAutoDutyStatus
+// in shiftUtils.ts — and syncs duty_status back here automatically.
+app.patch("/fleet/drivers/:id/shift", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { id } = req.params;
+  const { shiftStart, shiftEnd } = req.body;
+
+  if (!shiftStart || !shiftEnd) {
+    return res.status(400).json({ success: false, message: "shiftStart and shiftEnd are required." });
+  }
+
+  try {
+    const [result] = await db.query(
+      "UPDATE fleet_drivers SET shift_start = ?, shift_end = ?, updated_at = NOW() WHERE id = ?",
+      [shiftStart, shiftEnd, id],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Driver not found." });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("PATCH /fleet/drivers/:id/shift error:", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
@@ -4936,6 +5648,1168 @@ app.patch("/fleet/locations/:id", async (req, res) => {
   } catch (err) {
     console.error("Update location failed:", err);
     res.status(500).json({ success: false, message: "Failed to update location." });
+  }
+});
+
+
+// ─── ROOM RESERVATIONS ROUTES ──────────────────────────────────────────────
+
+const ROOM_MAX_ATTENDEES = {
+  "Conference Room": 15,
+  "Meeting Room 1": 6,
+  "Meeting Room 2": 6,
+};
+
+function addOneHour(timeStr) {
+  const [h, m, s] = timeStr.split(":").map(Number);
+  const d = new Date(2000, 0, 1, h, m, s || 0);
+  d.setHours(d.getHours() + 1);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// GET /room-reservations — optional ?date=YYYY-MM-DD and ?room=
+app.get("/room-reservations", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { date, room } = req.query;
+
+  // No default status filter — cancelled reservations still need to show
+  // in the admin table (just hidden from the calendar client-side). The
+  // booking form's own conflict-check query filters status = 'confirmed'
+  // separately in POST /room-reservations, so this change doesn't affect
+  // double-booking prevention.
+  const conditions = [];
+  const params = [];
+  if (date) { conditions.push("booking_date = ?"); params.push(date); }
+  if (room) { conditions.push("room_name = ?"); params.push(room); }
+  const whereClause = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  try {
+    const [rows] = await db.query(
+      `SELECT * FROM room_reservations ${whereClause} ORDER BY booking_date ASC, start_time ASC`,
+      params,
+    );
+
+    // Map snake_case DB columns -> camelCase, matching the frontend's
+    // RoomReservation type (mirrors how /fleet/trips and /supply-requests
+    // already shape their responses).
+    //
+    // booking_date is a DATE column — without dateStrings on the pool,
+    // mysql2 returns it as a JS Date object, which JSON.stringify then
+    // turns into a full ISO timestamp ("2026-08-19T00:00:00.000Z"). That
+    // broke the calendar view: it concatenates `${bookingDate} ${startTime}`
+    // expecting a clean "YYYY-MM-DD", and an ISO string with its own "T"
+    // in it produces an unparseable combined string, so every event
+    // silently failed to render (table still "worked" because it just
+    // printed whatever value it got). Format explicitly here instead of
+    // touching the global pool config.
+    const toDateOnly = (v) => {
+      if (!v) return null;
+      if (typeof v === "string") return v.slice(0, 10); // already "YYYY-MM-DD..."
+      const d = new Date(v);
+      const pad = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    };
+
+    const reservations = rows.map((r) => ({
+      id: r.id,
+      bookingId: r.booking_id,
+      roomRef: r.room_ref,
+      calendarSynced: !!r.outlook_event_id,
+      roomName: r.room_name,
+      maxAttendees: r.max_attendees,
+      bookingDate: toDateOnly(r.booking_date),
+      startTime: r.start_time,
+      endTime: r.end_time,
+      fullName: r.full_name,
+      email: r.email,
+      guestEmails: (() => {
+        try {
+          return r.guest_emails ? JSON.parse(r.guest_emails) : [];
+        } catch {
+          return [];
+        }
+      })(),
+      specialRequests: r.special_requests,
+      avRequirement: r.av_requirement,
+      needsWifi: !!r.needs_wifi,
+      agenda: r.agenda,
+      status: r.status,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+
+    return res.json({ success: true, count: reservations.length, reservations });
+  } catch (err) {
+    console.error("GET /room-reservations error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /room-reservations — books a room, rejecting any time-overlapping booking
+app.post("/room-reservations", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const {
+    roomName, bookingDate, startTime, endTime,
+    fullName, email, guestEmails, specialRequests,
+    avRequirement, needsWifi, agenda,
+  } = req.body;
+
+  if (!roomName || !bookingDate || !startTime || !fullName?.trim() || !email?.trim() || !agenda?.trim()) {
+    return res.status(400).json({
+      success: false,
+      message: "roomName, bookingDate, startTime, fullName, email, and agenda are required.",
+    });
+  }
+
+  if (!ROOM_MAX_ATTENDEES[roomName]) {
+    return res.status(400).json({ success: false, message: `Invalid room "${roomName}".` });
+  }
+
+  const finalEndTime = endTime || addOneHour(startTime);
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [conflicts] = await conn.query(
+      `SELECT id, start_time, end_time FROM room_reservations
+       WHERE room_name = ?
+         AND booking_date = ?
+         AND status = 'confirmed'
+         AND start_time < ?
+         AND end_time > ?
+       FOR UPDATE`,
+      [roomName, bookingDate, finalEndTime, startTime],
+    );
+
+    if (conflicts.length > 0) {
+      await conn.rollback();
+      return res.status(409).json({
+        success: false,
+        message: `${roomName} is already booked from ${conflicts[0].start_time} to ${conflicts[0].end_time} on this date.`,
+      });
+    }
+
+    // Sequential human-readable ref, same pattern as TRIP-YYYY-#### and
+    // SR-YYYY-#### — the UUID (booking_id) stays as the internal PK
+    // reference, but this is what gets shown to the requester.
+    const year = new Date().getFullYear();
+    const [maxRows] = await conn.query(
+      `SELECT MAX(CAST(SUBSTRING_INDEX(room_ref, '-', -1) AS UNSIGNED)) AS maxNum
+       FROM room_reservations WHERE room_ref LIKE ? FOR UPDATE`,
+      [`ROOM-${year}-%`],
+    );
+    const nextNum = String((maxRows[0].maxNum ?? 0) + 1).padStart(4, "0");
+    const roomRef = `ROOM-${year}-${nextNum}`;
+
+    const bookingId = crypto.randomUUID();
+
+    const [result] = await conn.query(
+      `INSERT INTO room_reservations
+        (booking_id, room_ref, room_name, max_attendees, booking_date, start_time, end_time,
+         full_name, email, guest_emails, special_requests,
+         av_requirement, needs_wifi, agenda, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'confirmed', NOW(), NOW())`,
+      [
+        bookingId, roomRef, roomName, ROOM_MAX_ATTENDEES[roomName], bookingDate, startTime, finalEndTime,
+        fullName.trim(), email.trim(),
+        Array.isArray(guestEmails) ? JSON.stringify(guestEmails) : null,
+        specialRequests ?? "",
+        avRequirement ?? "None", needsWifi ? 1 : 0, agenda.trim(),
+      ],
+    );
+
+    await conn.commit();
+
+    // Push to the room's own Outlook mailbox — mirrors the fleet trip
+    // "create on booking" step in POST /fleet/trips. Best-effort: a failed
+    // sync should never fail the booking itself.
+    try {
+      const eventId = await createRoomEvent({
+        roomRef,
+        roomName,
+        bookingDate,
+        startTime,
+        endTime: finalEndTime,
+        fullName: fullName.trim(),
+        email: email.trim(),
+        guestEmails: Array.isArray(guestEmails) ? guestEmails : [],
+        agenda: agenda.trim(),
+        specialRequests: specialRequests ?? "",
+        avRequirement: avRequirement ?? "None",
+        needsWifi: !!needsWifi,
+      });
+      await db.query(
+        "UPDATE room_reservations SET outlook_event_id = ? WHERE id = ?",
+        [eventId, result.insertId],
+      );
+    } catch (err) {
+      console.error("Outlook calendar sync (room booking) failed:", err.message);
+    }
+
+    sendRoomReservationConfirmation({
+      toEmail: email.trim(),
+      fullName: fullName.trim(),
+      roomRef,
+      roomName,
+      bookingDate,
+      startTime,
+      endTime: finalEndTime,
+      agenda: agenda.trim(),
+    });
+
+    return res.status(201).json({ success: true, id: result.insertId, bookingId, roomRef });
+  } catch (err) {
+    await conn.rollback();
+    console.error("POST /room-reservations error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// POST /room-reservations/:id/cancel
+app.post("/room-reservations/:id/cancel", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { id } = req.params;
+  try {
+    const [rows] = await db.query(
+      "SELECT room_name, outlook_event_id FROM room_reservations WHERE id = ?",
+      [id],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Reservation not found." });
+    }
+
+    const [result] = await db.query(
+      "UPDATE room_reservations SET status = 'cancelled', updated_at = NOW() WHERE id = ?",
+      [id],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "Reservation not found." });
+    }
+
+    if (rows[0].outlook_event_id) {
+      try {
+        await deleteRoomEvent(rows[0].outlook_event_id, rows[0].room_name);
+      } catch (err) {
+        console.error("Outlook calendar sync (room cancel) failed:", err.message);
+      }
+    }
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /room-reservations/:id/cancel error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── SEAT PLAN ROUTES ───────────────────────────────────────────────────────
+// Table: seat_plan_layouts (plan_key VARCHAR UNIQUE, layout_json LONGTEXT,
+// updated_by VARCHAR, created_at, updated_at) — one row per named floor plan
+// ("unit3", etc.), read/written as an opaque JSON blob by the seat plan editor.
+
+// GET /seat-plan/:key
+app.get("/seat-plan/:key", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { key } = req.params;
+
+  try {
+    const [rows] = await db.query(
+      "SELECT layout_json, updated_by, updated_at FROM seat_plan_layouts WHERE plan_key = ?",
+      [key],
+    );
+    if (rows.length === 0) {
+      return res.json({ success: true, layout: null });
+    }
+    let layout;
+    try {
+      layout = JSON.parse(rows[0].layout_json);
+    } catch (err) {
+      console.error("GET /seat-plan parse error:", err.message);
+      return res.status(500).json({ success: false, message: "Stored layout is corrupted." });
+    }
+    return res.json({
+      success: true,
+      layout,
+      updatedBy: rows[0].updated_by,
+      updatedAt: rows[0].updated_at,
+    });
+  } catch (err) {
+    console.error("GET /seat-plan error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /seat-plan/:key — body: { layout, updatedByName }
+app.post("/seat-plan/:key", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const { key } = req.params;
+  const { layout, updatedByName } = req.body;
+
+  if (!layout || !Array.isArray(layout.rooms) || !Array.isArray(layout.seats)) {
+    return res.status(400).json({ success: false, message: "layout with rooms[] and seats[] is required." });
+  }
+
+  try {
+    const layoutJson = JSON.stringify(layout);
+    const savedBy = updatedByName || decoded.displayName || decoded.username || "Unknown";
+
+    await db.query(
+      `INSERT INTO seat_plan_layouts (plan_key, layout_json, updated_by)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE layout_json = VALUES(layout_json), updated_by = VALUES(updated_by)`,
+      [key, layoutJson, savedBy],
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("POST /seat-plan error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// EIA sign sheet export (Word)
+app.use(
+  "/api/it",
+  (req, res, next) => (requireAuth(req, res) ? next() : undefined),
+  require("./eiaExport"),
+);
+
+// ─── EIA SIGN SHEETS (saved records) ────────────────────────────────────────
+
+// POST /it/eia-sign-sheets — saves a record. ref_no is the unique key, so a
+// repeat save with the same ref_no (e.g. exporting the same form twice) is
+// treated as idempotent rather than an error — it just returns the existing
+// record instead of failing.
+app.post("/it/eia-sign-sheets", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+
+  const {
+    company, copyLabel, name, department, date, issuedNo, refNo,
+    items, remarks, issuedTo, deliveredBy, approvedBy, preparedBy,
+  } = req.body;
+
+  if (!refNo || !company || !name) {
+    return res.status(400).json({ success: false, message: "refNo, company, and name are required." });
+  }
+
+  try {
+    const [existing] = await db.query(
+      "SELECT id FROM eia_sign_sheets WHERE ref_no = ?",
+      [refNo],
+    );
+    if (existing.length > 0) {
+      return res.json({ success: true, id: existing[0].id, alreadySaved: true });
+    }
+
+    const id = crypto.randomUUID();
+    await db.query(
+      `INSERT INTO eia_sign_sheets
+        (id, ref_no, company, copy_label, full_name, department, issue_date, issued_no,
+         items, remarks, issued_to_name, issued_to_date, delivered_by_name, delivered_by_date,
+         approved_by_name, approved_by_date, prepared_by, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+      [
+        id, refNo, company, copyLabel ?? "", name, department ?? "",
+        date || null, issuedNo ?? "",
+        JSON.stringify(items ?? []), remarks ?? "",
+        issuedTo?.name ?? "", issuedTo?.date || null,
+        deliveredBy?.name ?? "", deliveredBy?.date || null,
+        approvedBy?.name ?? "", approvedBy?.date || null,
+        preparedBy ?? "",
+      ],
+    );
+    return res.status(201).json({ success: true, id, alreadySaved: false });
+  } catch (err) {
+    if (err.code === "ER_DUP_ENTRY") {
+      // Race: two saves for the same refNo landed at once — treat the same
+      // as the existing-row branch above.
+      const [rows] = await db.query("SELECT id FROM eia_sign_sheets WHERE ref_no = ?", [refNo]);
+      return res.json({ success: true, id: rows[0]?.id, alreadySaved: true });
+    }
+    console.error("POST /it/eia-sign-sheets error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /it/eia-sign-sheets/:refNo — look up one record by Ref No., for the
+// Forms page's "search and load" feature.
+app.get("/it/eia-sign-sheets/:refNo", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM eia_sign_sheets WHERE ref_no = ?",
+      [req.params.refNo],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "No record found for that Ref. No." });
+    }
+    const r = rows[0];
+    return res.json({
+      success: true,
+      sheet: {
+        id: r.id,
+        refNo: r.ref_no,
+        company: r.company,
+        copyLabel: r.copy_label,
+        name: r.full_name,
+        department: r.department,
+        date: r.issue_date,
+        issuedNo: r.issued_no,
+        items: (() => {
+          if (Array.isArray(r.items)) return r.items; // mysql2 auto-parses JSON columns
+          try { return JSON.parse(r.items || "[]"); } catch { return []; }
+        })(),
+        remarks: r.remarks,
+        issuedTo: { name: r.issued_to_name, date: r.issued_to_date },
+        deliveredBy: { name: r.delivered_by_name, date: r.delivered_by_date },
+        approvedBy: { name: r.approved_by_name, date: r.approved_by_date },
+        preparedBy: r.prepared_by,
+      },
+    });
+  } catch (err) {
+    console.error("GET /it/eia-sign-sheets/:refNo error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUT /it/eia-sign-sheets/:refNo — updates an existing record. ref_no in the
+// URL identifies which row to update; the body's own refNo is ignored so the
+// unique key can't be changed out from under an update.
+app.put("/it/eia-sign-sheets/:refNo", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  const { refNo } = req.params;
+  const {
+    company, copyLabel, name, department, date, issuedNo,
+    items, remarks, issuedTo, deliveredBy, approvedBy, preparedBy,
+  } = req.body;
+
+  if (!company || !name) {
+    return res.status(400).json({ success: false, message: "company and name are required." });
+  }
+
+  try {
+    const [result] = await db.query(
+      `UPDATE eia_sign_sheets SET
+         company = ?, copy_label = ?, full_name = ?, department = ?, issue_date = ?, issued_no = ?,
+         items = ?, remarks = ?, issued_to_name = ?, issued_to_date = ?,
+         delivered_by_name = ?, delivered_by_date = ?, approved_by_name = ?, approved_by_date = ?,
+         prepared_by = ?, updated_at = NOW()
+       WHERE ref_no = ?`,
+      [
+        company, copyLabel ?? "", name, department ?? "", date || null, issuedNo ?? "",
+        JSON.stringify(items ?? []), remarks ?? "",
+        issuedTo?.name ?? "", issuedTo?.date || null,
+        deliveredBy?.name ?? "", deliveredBy?.date || null,
+        approvedBy?.name ?? "", approvedBy?.date || null,
+        preparedBy ?? "",
+        refNo,
+      ],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "No record found for that Ref. No." });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("PUT /it/eia-sign-sheets/:refNo error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /it/eia-sign-sheets — list saved records, newest first
+app.get("/it/eia-sign-sheets", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM eia_sign_sheets ORDER BY created_at DESC",
+    );
+    const sheets = rows.map((r) => ({
+      id: r.id,
+      refNo: r.ref_no,
+      company: r.company,
+      copyLabel: r.copy_label,
+      name: r.full_name,
+      department: r.department,
+      date: r.issue_date,
+      issuedNo: r.issued_no,
+      items: (() => {
+        if (Array.isArray(r.items)) return r.items; // mysql2 auto-parses JSON columns
+        try { return JSON.parse(r.items || "[]"); } catch { return []; }
+      })(),
+      remarks: r.remarks,
+      issuedTo: { name: r.issued_to_name, date: r.issued_to_date },
+      deliveredBy: { name: r.delivered_by_name, date: r.delivered_by_date },
+      approvedBy: { name: r.approved_by_name, date: r.approved_by_date },
+      preparedBy: r.prepared_by,
+      createdAt: r.created_at,
+    }));
+    return res.json({ success: true, count: sheets.length, sheets });
+  } catch (err) {
+    console.error("GET /it/eia-sign-sheets error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── FPD STATEMENTS OF ACCOUNT ──────────────────────────────────────────────
+// Tables: fpd_statements, fpd_bank_templates.
+// Statement No. format: FPD.<year>.<NN>  (e.g. FPD.2026.01), year taken from
+// the statement date, sequence generated here under a row lock.
+
+function fpdYear(dateStr) {
+  const y = String(dateStr || "").slice(0, 4);
+  return /^\d{4}$/.test(y) ? y : String(new Date().getFullYear());
+}
+
+// FPD is confidential: only these executives create real FPD statements, and
+// every user (superadmin included) can only ever see statements they created.
+const FPD_EXECUTIVES = ["msy", "jafable", "mnatan"];
+const fpdOwner = (d) => String(d?.username || "").toLowerCase();
+const fpdIsExec = (d) => FPD_EXECUTIVES.includes(fpdOwner(d));
+// Everyone else (e.g. you testing) gets a separate TEST sequence.
+const fpdPrefix = (d) => (fpdIsExec(d) ? "FPD" : "TEST");
+
+function fpdDateOnly(v) {
+  if (!v) return null;
+  if (typeof v === "string") return v.slice(0, 10);
+  const d = new Date(v);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+function fpdParseJson(v, fallback) {
+  if (v && typeof v === "object") return v; // mysql2 auto-parses JSON columns
+  try { return JSON.parse(v || "null") ?? fallback; } catch { return fallback; }
+}
+
+// Total is always recomputed here — the client's numbers are never trusted.
+function fpdComputeLine(raw) {
+  const unitPrice = Math.max(0, Number(raw.unitPrice) || 0);
+  const pct = raw.discounted
+    ? Math.min(100, Math.max(0, Number(raw.discountPercent) || 0))
+    : 0;
+  return {
+    date: raw.date || null,
+    description: String(raw.description ?? ""),
+    unitPrice,
+    discounted: pct > 0,
+    discountPercent: pct,
+    total: Math.round(unitPrice * (1 - pct / 100) * 100) / 100,
+  };
+}
+
+function fpdBankFromRow(r) {
+  return {
+    id: r.id,
+    label: r.label,
+    accountName: r.account_name,
+    accountAddress: r.account_address,
+    bankName: r.bank_name,
+    branchName: r.branch_name,
+    branchAddress: r.branch_address,
+    accountNo: r.account_no,
+    swiftCode: r.swift_code,
+    isDefault: !!r.is_default,
+    fields: fpdParseJson(r.detail_fields, null),
+  };
+}
+
+function fpdStatementFromRow(r) {
+  return {
+    id: r.id,
+    statementNo: r.statement_no,
+    date: fpdDateOnly(r.statement_date),
+    billToName: r.bill_to_name,
+    billToAddress: r.bill_to_address,
+    currency: r.currency,
+    fromCurrency: r.from_currency || "₱",
+    items: fpdParseJson(r.items, []),
+    totalAmount: Number(r.total_amount),
+    exchangeRate: Number(r.exchange_rate ?? 1),
+    bankTemplateId: r.bank_template_id,
+    bank: fpdParseJson(r.bank_snapshot, {}),
+    preparedBy: r.prepared_by,
+    createdBy: r.created_by,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+// Validates + normalizes the body shared by POST and PUT. Returns
+// { error } or { lines, total }.
+function fpdPrepareBody(body) {
+  const { date, billToName, items } = body;
+  if (!date || !billToName?.trim()) {
+    return { error: "date and billToName are required." };
+  }
+  if (!Array.isArray(items)) {
+    return { error: "items array is required." };
+  }
+  const lines = items
+    .map(fpdComputeLine)
+    .filter((l) => l.date || l.description.trim() || l.unitPrice > 0);
+  if (lines.length === 0) {
+    return { error: "At least one statement line is required." };
+  }
+  const currency = body.currency || "₱";
+  const fromCurrency = body.fromCurrency || "₱";
+  const rate = fromCurrency === currency ? 1 : Number(body.exchangeRate);
+  if (!(rate > 0)) {
+    return { error: "A valid exchange rate is required when converting between currencies." };
+  }
+  const f = currency === "¥" ? 1 : 100;
+  const sum = lines.reduce((s, l) => s + Math.round(l.total * rate * f) / f, 0);
+  return { lines, total: Math.round(sum * f) / f, rate, fromCurrency };
+}
+
+// Resolves the bank block to store on a statement: a saved template (by id)
+// or an inline bank object. Returns { bank, templateId } or { error, status }.
+async function fpdResolveBank(conn, { bankTemplateId, bank }) {
+  if (bankTemplateId) {
+    const [rows] = await conn.query("SELECT * FROM fpd_bank_templates WHERE id = ?", [bankTemplateId]);
+    if (rows.length === 0) return { error: "Bank template not found.", status: 404 };
+    const b = fpdBankFromRow(rows[0]);
+    return {
+      templateId: b.id,
+      bank: {
+        accountName: b.accountName, accountAddress: b.accountAddress, bankName: b.bankName,
+        branchName: b.branchName, branchAddress: b.branchAddress,
+        accountNo: b.accountNo, swiftCode: b.swiftCode,
+      },
+    };
+  }
+  if (bank && bank.accountName && bank.bankName && bank.accountNo) {
+    return {
+      templateId: null,
+      bank: {
+        accountName: bank.accountName, accountAddress: bank.accountAddress ?? "",
+        bankName: bank.bankName, branchName: bank.branchName ?? "",
+        branchAddress: bank.branchAddress ?? "", accountNo: bank.accountNo,
+        swiftCode: bank.swiftCode ?? "",
+      },
+    };
+  }
+  return { error: "bankTemplateId or a complete bank object is required.", status: 400 };
+}
+
+// GET /fpd/next-number?date=YYYY-MM-DD — preview only (doesn't reserve the
+// number); the real one is assigned inside POST /fpd/statements.
+app.get("/fpd/next-number", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  const year = fpdYear(req.query.date);
+  const prefix = fpdPrefix(decoded);
+  try {
+    const next = String(await fpdNextSeq(db, year, false, prefix)).padStart(2, "0");
+    const needsSeed = await fpdNeedsSeed(db, year, prefix);
+    return res.json({ success: true, statementNo: `${prefix}.${year}.${next}`, needsSeed });
+  } catch (err) {
+    console.error("GET /fpd/next-number error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Bank templates ──────────────────────────────────────────────────────────
+
+// Next sequence = the higher of (a) the highest saved statement and (b) the
+// "last number already used" you set manually, plus 1.
+async function fpdNextSeq(conn, year, lock, prefix = "FPD") {
+  const [maxRows] = await conn.query(
+    `SELECT MAX(CAST(SUBSTRING_INDEX(statement_no, '.', -1) AS UNSIGNED)) AS maxNum
+     FROM fpd_statements WHERE statement_no LIKE ?${lock ? " FOR UPDATE" : ""}`,
+    [`${prefix}.${year}.%`],
+  );
+  let seed = 0;
+  if (prefix === "FPD") {
+    const [seedRows] = await conn.query(
+      "SELECT last_number FROM fpd_number_seeds WHERE year = ?",
+      [year],
+    );
+    seed = seedRows[0]?.last_number ?? 0;
+  }
+  return Math.max(maxRows[0].maxNum ?? 0, seed) + 1;
+}
+
+// Only the real FPD sequence ever needs seeding.
+async function fpdNeedsSeed(conn, year, prefix = "FPD") {
+  if (prefix !== "FPD") return false;
+  const [seed] = await conn.query("SELECT 1 FROM fpd_number_seeds WHERE year = ? LIMIT 1", [year]);
+  const [stmt] = await conn.query("SELECT 1 FROM fpd_statements WHERE statement_no LIKE ? LIMIT 1", [`FPD.${year}.%`]);
+  return seed.length === 0 && stmt.length === 0;
+}
+
+// PUT /fpd/last-number — body: { date, lastNumber }
+// Sets the last statement number already used (typed manually before this
+// system existed) for that date's year. The next saved statement is +1.
+app.put("/fpd/last-number", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  if (!fpdIsExec(decoded)) {
+    return res.status(403).json({ success: false, message: "Not authorized." });
+  }
+  const year = fpdYear(req.body.date);
+  const lastNumber = Number(req.body.lastNumber);
+  if (!Number.isInteger(lastNumber) || lastNumber < 0) {
+    return res.status(400).json({ success: false, message: "lastNumber must be a whole number." });
+  }
+
+  try {
+    await db.query(
+      `INSERT INTO fpd_number_seeds (year, last_number, updated_by)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE last_number = VALUES(last_number), updated_by = VALUES(updated_by)`,
+      [year, lastNumber, decoded.displayName ?? decoded.username ?? null],
+    );
+    const next = String(await fpdNextSeq(db, year, false)).padStart(2, "0");
+    return res.json({ success: true, statementNo: `FPD.${year}.${next}` });
+  } catch (err) {
+    console.error("PUT /fpd/last-number error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /fpd/bank-templates — default first, then alphabetical
+app.get("/fpd/bank-templates", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM fpd_bank_templates ORDER BY is_default DESC, label ASC",
+    );
+    return res.json({ success: true, count: rows.length, templates: rows.map(fpdBankFromRow) });
+  } catch (err) {
+    console.error("GET /fpd/bank-templates error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST /fpd/bank-templates — same 7 fields as the default bank + a label
+app.post("/fpd/bank-templates", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const { label, fields, createdByName } = req.body;
+
+  const cleaned = (Array.isArray(fields) ? fields : [])
+    .map((f) => ({
+      label: String(f?.label ?? "").trim(),
+      value: String(f?.value ?? "").trim(),
+    }))
+    .filter((f) => f.label || f.value);
+
+  if (cleaned.length === 0 || cleaned.some((f) => !f.label)) {
+    return res.status(400).json({
+      success: false,
+      message: "At least one detail is required, and every detail needs a label.",
+    });
+  }
+
+  try {
+    const [result] = await db.query(
+      `INSERT INTO fpd_bank_templates
+        (label, account_name, account_address, bank_name, branch_name, branch_address,
+         account_no, swift_code, detail_fields, is_default, created_by)
+       VALUES (?, '', '', '', '', '', '', '', ?, 0, ?)`,
+      [
+        (label || "").trim() || cleaned[0].value || "Bank template",
+        JSON.stringify(cleaned),
+        createdByName ?? decoded.displayName ?? decoded.username ?? null,
+      ],
+    );
+    const [rows] = await db.query("SELECT * FROM fpd_bank_templates WHERE id = ?", [result.insertId]);
+    return res.status(201).json({ success: true, template: fpdBankFromRow(rows[0]) });
+  } catch (err) {
+    console.error("POST /fpd/bank-templates error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// DELETE /fpd/bank-templates/:id — the fixed default can't be deleted.
+// Saved statements are unaffected (they keep their own bank_snapshot).
+app.delete("/fpd/bank-templates/:id", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    const [rows] = await db.query("SELECT is_default FROM fpd_bank_templates WHERE id = ?", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Template not found." });
+    }
+    if (rows[0].is_default) {
+      return res.status(400).json({ success: false, message: "The default bank template can't be deleted." });
+    }
+    await db.query("DELETE FROM fpd_bank_templates WHERE id = ?", [req.params.id]);
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /fpd/bank-templates/:id error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ── Statements ──────────────────────────────────────────────────────────────
+
+// POST /fpd/statements
+// body: { date, billToName, billToAddress, currency, items: [{ date, description,
+//         unitPrice, discounted, discountPercent }], bankTemplateId | bank,
+//         preparedBy, createdByName }
+app.post("/fpd/statements", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const prepared = fpdPrepareBody(req.body);
+  if (prepared.error) {
+    return res.status(400).json({ success: false, message: prepared.error });
+  }
+
+  const { date, billToName, billToAddress, currency, bankTemplateId, bank, preparedBy, createdByName } = req.body;
+  const manualNo = String(req.body.statementNo ?? "").trim();
+  if (manualNo.length > 50) {
+    return res.status(400).json({ success: false, message: "Statement No. is too long." });
+  }
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const resolved = await fpdResolveBank(conn, { bankTemplateId, bank });
+    if (resolved.error) {
+      await conn.rollback();
+      return res.status(resolved.status).json({ success: false, message: resolved.error });
+    }
+
+    let statementNo;
+    if (manualNo) {
+      const [dupe] = await conn.query(
+        "SELECT 1 FROM fpd_statements WHERE statement_no = ? FOR UPDATE",
+        [manualNo],
+      );
+      if (dupe.length > 0) {
+        await conn.rollback();
+        return res.status(409).json({ success: false, message: `${manualNo} already exists.` });
+      }
+      statementNo = manualNo;
+    } else {
+      const year = fpdYear(date);
+      const prefix = fpdPrefix(decoded);
+      const nextNum = String(await fpdNextSeq(conn, year, true, prefix)).padStart(2, "0");
+      statementNo = `${prefix}.${year}.${nextNum}`;
+    }
+
+    const id = crypto.randomUUID();
+    await conn.query(
+      `INSERT INTO fpd_statements
+        (id, statement_no, statement_date, bill_to_name, bill_to_address, currency, from_currency,
+         items, total_amount, exchange_rate, bank_template_id, bank_snapshot, prepared_by,
+         created_by, created_by_username)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, statementNo, date, billToName.trim(), billToAddress ?? "", currency || "₱", prepared.fromCurrency,
+        JSON.stringify(prepared.lines), prepared.total, prepared.rate,
+        resolved.templateId, JSON.stringify(resolved.bank),
+        preparedBy ?? "",
+        createdByName ?? decoded.displayName ?? decoded.username ?? null,
+        fpdOwner(decoded),
+      ],
+    );
+
+    await conn.commit();
+    return res.status(201).json({ success: true, id, statementNo, totalAmount: prepared.total });
+  } catch (err) {
+    await conn.rollback();
+    if (err.code === "ER_DUP_ENTRY") {
+      return res.status(409).json({ success: false, message: "That Statement No. already exists." });
+    }
+    console.error("POST /fpd/statements error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// GET /fpd/statements — newest first
+app.get("/fpd/statements", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM fpd_statements WHERE created_by_username = ? ORDER BY created_at DESC",
+      [fpdOwner(decoded)],
+    );
+    return res.json({ success: true, count: rows.length, statements: rows.map(fpdStatementFromRow) });
+  } catch (err) {
+    console.error("GET /fpd/statements error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// GET /fpd/statements/:statementNo — e.g. /fpd/statements/FPD.2026.01
+app.get("/fpd/statements/:statementNo", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  try {
+    const [rows] = await db.query(
+      "SELECT * FROM fpd_statements WHERE statement_no = ? AND created_by_username = ?",
+      [req.params.statementNo, fpdOwner(decoded)],
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "No statement found for that number." });
+    }
+    return res.json({ success: true, statement: fpdStatementFromRow(rows[0]) });
+  } catch (err) {
+    console.error("GET /fpd/statements/:statementNo error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// PUT /fpd/statements/:statementNo — number changes only if body.statementNo is sent. Bank
+// details are only replaced when bankTemplateId/bank is sent.
+app.put("/fpd/statements/:statementNo", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+
+  const prepared = fpdPrepareBody(req.body);
+  if (prepared.error) {
+    return res.status(400).json({ success: false, message: prepared.error });
+  }
+
+  const { date, billToName, billToAddress, currency, bankTemplateId, bank, preparedBy } = req.body;
+  const newNo = String(req.body.statementNo ?? "").trim() || req.params.statementNo;
+  if (newNo.length > 50) {
+    return res.status(400).json({ success: false, message: "Statement No. is too long." });
+  }
+
+  const conn = await db.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    if (newNo !== req.params.statementNo) {
+      const [dupe] = await conn.query(
+        "SELECT 1 FROM fpd_statements WHERE statement_no = ? FOR UPDATE",
+        [newNo],
+      );
+      if (dupe.length > 0) {
+        await conn.rollback();
+        return res.status(409).json({ success: false, message: `${newNo} already exists.` });
+      }
+    }
+
+    const [existing] = await conn.query(
+      "SELECT id FROM fpd_statements WHERE statement_no = ? AND created_by_username = ? FOR UPDATE",
+      [req.params.statementNo, fpdOwner(decoded)],
+    );
+    if (existing.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ success: false, message: "No statement found for that number." });
+    }
+
+    const bankProvided = Boolean(bankTemplateId || bank);
+    let bankSql = "";
+    const bankParams = [];
+    if (bankProvided) {
+      const resolved = await fpdResolveBank(conn, { bankTemplateId, bank });
+      if (resolved.error) {
+        await conn.rollback();
+        return res.status(resolved.status).json({ success: false, message: resolved.error });
+      }
+      bankSql = ", bank_template_id = ?, bank_snapshot = ?";
+      bankParams.push(resolved.templateId, JSON.stringify(resolved.bank));
+    }
+
+    await conn.query(
+      `UPDATE fpd_statements SET
+         statement_no = ?, statement_date = ?, bill_to_name = ?, bill_to_address = ?,
+         currency = ?, from_currency = ?,
+         items = ?, total_amount = ?, exchange_rate = ?, prepared_by = ?${bankSql}
+       WHERE statement_no = ? AND created_by_username = ?`,
+      [
+        newNo, date, billToName.trim(), billToAddress ?? "", currency || "₱", prepared.fromCurrency,
+        JSON.stringify(prepared.lines), prepared.total, prepared.rate, preparedBy ?? "",
+        ...bankParams,
+        req.params.statementNo, fpdOwner(decoded),
+      ],
+    );
+
+    await conn.commit();
+    return res.json({ success: true, statementNo: newNo, totalAmount: prepared.total });
+  } catch (err) {
+    await conn.rollback();
+    console.error("PUT /fpd/statements/:statementNo error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// DELETE /fpd/statements/:statementNo — removes the whole statement.
+app.delete("/fpd/statements/:statementNo", async (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  try {
+    const [result] = await db.query(
+      "DELETE FROM fpd_statements WHERE statement_no = ? AND created_by_username = ?",
+      [req.params.statementNo, fpdOwner(decoded)],
+    );
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ success: false, message: "No statement found for that number." });
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("DELETE /fpd/statements/:statementNo error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── FPD: BSP REFERENCE EXCHANGE RATES ──────────────────────────────────────
+let pdfParse = null;
+try {
+  pdfParse = require("pdf-parse/lib/pdf-parse.js");
+} catch (err) {
+  console.warn("⚠ pdf-parse unavailable — BSP rates disabled, using fallback:", err.message);
+}
+
+const BSP_BASE = "https://www.bsp.gov.ph";
+// Pages that list the daily RERB PDFs. Override with BSP_RERB_INDEX_URLS
+// (comma-separated) in .env if BSP moves things around.
+const BSP_RERB_INDEX_URLS = (
+  process.env.BSP_RERB_INDEX_URLS ||
+  `${BSP_BASE}/SitePages/Statistics/ExchangeRate.aspx,${BSP_BASE}/Lists/RERB/AllItems.aspx`
+).split(",");
+
+const FX_TTL = 60 * 60 * 1000;                    // BSP posts once a day; hourly check is plenty
+const BSP_STALE_MAX_MS = 7 * 24 * 60 * 60 * 1000; // keep serving the last good BSP rate this long
+const MONTHS_IDX = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+
+let fxCache = { at: 0, data: null };
+let lastGoodBsp = null; // { at, data }
+let pushedBsp = null;   // latest BSP rates pushed by the VM fetcher job
+
+async function bspGet(url) {
+  const r = await fetch(url, {
+    headers: { "User-Agent": "Mozilla/5.0" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} from ${url}`);
+  return r;
+}
+
+// Scans the index pages for RERB PDF links and returns the most recent one.
+async function findLatestRerbPdf() {
+  const re = /\/Lists\/RERB\/Attachments\/\d+\/(\d{1,2})([A-Za-z]{3})(\d{4})\.pdf/gi;
+  let best = null;
+  for (const indexUrl of BSP_RERB_INDEX_URLS) {
+    try {
+      const html = await (await bspGet(indexUrl.trim())).text();
+      for (const m of html.matchAll(re)) {
+        const mon = MONTHS_IDX[m[2].toLowerCase()];
+        if (mon === undefined) continue;
+        const date = new Date(Date.UTC(+m[3], mon, +m[1]));
+        if (!best || date > best.date) best = { date, url: BSP_BASE + m[0] };
+      }
+    } catch (e) {
+      console.warn("RERB index fetch failed:", indexUrl, e.message);
+    }
+    if (best) break;
+  }
+  if (!best) throw new Error("No RERB PDF link found on the BSP index pages");
+  return best;
+}
+
+async function fromBsp() {
+  if (pushedBsp && Date.now() - pushedBsp.at < BSP_STALE_MAX_MS) return pushedBsp.data;
+  throw new Error("No recent BSP rates pushed by the fetcher job");
+  // eslint-disable-next-line no-unreachable -- legacy PDF path, blocked by Akamai
+  if (!pdfParse) throw new Error("pdf-parse not available");
+  let date, buf;
+  if (process.env.BSP_LOCAL_PDF) {
+    const fs = require("fs");
+    const file = process.env.BSP_LOCAL_PDF;
+    buf = fs.readFileSync(file);
+    // Expects a filename like 13Jan2026.pdf to derive the as-of date
+    const m = file.match(/(\d{1,2})([A-Za-z]{3})(\d{4})\.pdf$/i);
+    const mon = m ? MONTHS_IDX[m[2].toLowerCase()] : undefined;
+    date = m && mon !== undefined
+      ? new Date(Date.UTC(+m[3], mon, +m[1]))
+      : fs.statSync(file).mtime;
+  } else {
+    const found = await findLatestRerbPdf();
+    date = found.date;
+    buf = Buffer.from(await (await bspGet(found.url)).arrayBuffer());
+  }
+  const { text } = await pdfParse(buf);
+
+  // Row format: "<no> <NAME> CODE  <EUR equiv>  <USD equiv>  <PHP equiv>"
+  const pesoPer = (code) => {
+    const m = text.match(new RegExp(`\\b${code}\\s+[\\d.]+\\s+[\\d.]+\\s+([\\d.]+)`));
+    return m ? parseFloat(m[1]) : null;
+  };
+  const usd = pesoPer("USD"), jpy = pesoPer("JPY"), aed = pesoPer("AED");
+  if (!(usd > 10 && usd < 200) || !(jpy > 0) || !(aed > 0)) {
+    throw new Error("BSP RERB parse failed (layout changed?)");
+  }
+
+  // App expects "foreign units per 1 PHP"
+  return {
+    source: "BSP",
+    asOf: date.toISOString().slice(0, 10),
+    rates: { USD: 1 / usd, JPY: 1 / jpy, AED: 1 / aed },
+  };
+}
+
+async function fromFallback() {
+  const d = await (await fetch("https://open.er-api.com/v6/latest/PHP")).json();
+  if (d.result !== "success") throw new Error("fallback failed");
+  return {
+    source: "open.er-api.com (BSP unavailable)",
+    asOf: new Date().toISOString().slice(0, 10),
+    rates: { USD: d.rates.USD, JPY: d.rates.JPY, AED: d.rates.AED },
+  };
+}
+
+// POST /fpd/bsp-rates — receives the daily BSP bulletin from the VM fetcher job
+// body: { asOf: "YYYY-MM-DD", pesoPer: { USD, JPY, AED } }  (pesos per 1 unit)
+app.post("/fpd/bsp-rates", (req, res) => {
+  const decoded = requireAuth(req, res);
+  if (!decoded) return;
+  if (decoded.role !== "superadmin") {
+    return res.status(403).json({ success: false, message: "Not authorized." });
+  }
+  const { asOf, pesoPer } = req.body || {};
+  const usd = Number(pesoPer?.USD), jpy = Number(pesoPer?.JPY), aed = Number(pesoPer?.AED);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(asOf || "") || !(usd > 10 && usd < 200) || !(jpy > 0) || !(aed > 0)) {
+    return res.status(400).json({ success: false, message: "Invalid BSP rates payload." });
+  }
+  pushedBsp = {
+    at: Date.now(),
+    data: { source: "BSP", asOf, rates: { USD: 1 / usd, JPY: 1 / jpy, AED: 1 / aed } },
+  };
+  fxCache = { at: 0, data: null }; // serve the new rates immediately
+  console.log(`BSP rates received for ${asOf}: USD ${usd}, JPY ${jpy}, AED ${aed}`);
+  return res.json({ success: true, asOf });
+});
+
+// GET /fpd/exchange-rates — BSP reference rates as "units per 1 PHP"
+app.get("/fpd/exchange-rates", async (req, res) => {
+  if (!requireAuth(req, res)) return;
+  try {
+    if (fxCache.data && Date.now() - fxCache.at < FX_TTL) return res.json(fxCache.data);
+
+    let data;
+    try {
+      data = await fromBsp();
+      lastGoodBsp = { at: Date.now(), data };
+    } catch (e) {
+      console.warn("BSP rate fetch failed:", e.message);
+      // Prefer a recent real BSP rate over a different source
+      if (lastGoodBsp && Date.now() - lastGoodBsp.at < BSP_STALE_MAX_MS) data = lastGoodBsp.data;
+      else data = await fromFallback();
+    }
+    fxCache = { at: Date.now(), data };
+    return res.json(data);
+  } catch (err) {
+    console.error("GET /fpd/exchange-rates error:", err);
+    return res.status(502).json({ success: false, message: "Exchange rates unavailable." });
   }
 });
 
